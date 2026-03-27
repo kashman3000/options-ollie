@@ -12,12 +12,13 @@ from enum import Enum
 
 
 class TradeType(str, Enum):
-    CSP = 'csp'                    # Cash-secured put (sold)
-    COVERED_CALL = 'covered_call'  # Covered call (sold)
-    IRON_CONDOR = 'iron_condor'    # Iron condor (sold)
+    CSP = 'csp'                          # Cash-secured put (sold)
+    COVERED_CALL = 'covered_call'        # Covered call (sold)
+    IRON_CONDOR = 'iron_condor'          # Iron condor (sold)
     BULL_PUT_SPREAD = 'bull_put_spread'
     BEAR_CALL_SPREAD = 'bear_call_spread'
-    LONG_SHARES = 'long_shares'    # Share assignment or purchase
+    LONG_SHARES = 'long_shares'          # Share assignment or purchase
+    PROTECTIVE_PUT = 'protective_put'    # Bought put hedge on existing shares
 
 
 class TradeStatus(str, Enum):
@@ -128,13 +129,13 @@ class TradeLedger:
     def enter_csp(self, symbol: str, strike: float, expiry: str,
                   premium_per_contract: float, contracts: int = 1,
                   commission: float = 0.0, notes: str = '',
-                  wheel_group: str = None) -> Trade:
+                  wheel_group: str = None, entry_date: str = None) -> Trade:
         """Record a cash-secured put sale."""
         trade = Trade(
             id=self._gen_id(),
             symbol=symbol.upper(),
             trade_type=TradeType.CSP,
-            entry_date=datetime.now().strftime('%Y-%m-%d'),
+            entry_date=entry_date or datetime.now().strftime('%Y-%m-%d'),
             entry_price=premium_per_contract,
             quantity=contracts,
             strike=strike,
@@ -153,13 +154,13 @@ class TradeLedger:
     def enter_covered_call(self, symbol: str, strike: float, expiry: str,
                            premium_per_contract: float, contracts: int = 1,
                            commission: float = 0.0, notes: str = '',
-                           wheel_group: str = None) -> Trade:
+                           wheel_group: str = None, entry_date: str = None) -> Trade:
         """Record a covered call sale."""
         trade = Trade(
             id=self._gen_id(),
             symbol=symbol.upper(),
             trade_type=TradeType.COVERED_CALL,
-            entry_date=datetime.now().strftime('%Y-%m-%d'),
+            entry_date=entry_date or datetime.now().strftime('%Y-%m-%d'),
             entry_price=premium_per_contract,
             quantity=contracts,
             strike=strike,
@@ -228,6 +229,32 @@ class TradeLedger:
             long_call_strike=long_strike if option_side == 'call' else None,
             premium_received=round(net_credit_per_contract * contracts * 100, 2),
             collateral_required=round((width - net_credit_per_contract) * contracts * 100, 2),
+            commission=commission,
+            notes=notes,
+        )
+        self.trades.append(trade)
+        self.save()
+        return trade
+
+    def enter_protective_put(self, symbol: str, strike: float, expiry: str,
+                             premium_per_contract: float, contracts: int = 1,
+                             commission: float = 0.0, notes: str = '',
+                             entry_date: str = None) -> Trade:
+        """Record a protective put purchase (long put hedge on existing shares).
+        Premium is a debit — premium_received is stored as a negative value.
+        """
+        trade = Trade(
+            id=self._gen_id(),
+            symbol=symbol.upper(),
+            trade_type=TradeType.PROTECTIVE_PUT,
+            entry_date=entry_date or datetime.now().strftime('%Y-%m-%d'),
+            entry_price=premium_per_contract,
+            quantity=contracts,
+            strike=strike,
+            expiry=expiry,
+            option_side='put',
+            premium_received=round(-premium_per_contract * contracts * 100, 2),  # debit
+            collateral_required=0.0,
             commission=commission,
             notes=notes,
         )
@@ -380,6 +407,33 @@ class TradeLedger:
 
         self.save()
         return new_trade
+
+    def delete_trade(self, trade_id: str) -> bool:
+        """Permanently remove a trade from the ledger. Returns True if found and deleted."""
+        before = len(self.trades)
+        self.trades = [t for t in self.trades if t.id != trade_id]
+        if len(self.trades) < before:
+            self.save()
+            return True
+        return False
+
+    def update_trade(self, trade_id: str, fields: dict) -> Optional[Trade]:
+        """Update arbitrary fields on a trade. Only known Trade fields are applied."""
+        trade = self.get_trade(trade_id)
+        if not trade:
+            return None
+        allowed = {
+            'symbol', 'trade_type', 'status', 'entry_date', 'entry_price',
+            'quantity', 'strike', 'expiry', 'option_side',
+            'short_put_strike', 'long_put_strike', 'short_call_strike', 'long_call_strike',
+            'premium_received', 'commission', 'collateral_required',
+            'exit_date', 'exit_price', 'realized_pnl', 'notes',
+        }
+        for k, v in fields.items():
+            if k in allowed:
+                setattr(trade, k, v)
+        self.save()
+        return trade
 
     # ── Query Methods ────────────────────────────────────────────────────
 

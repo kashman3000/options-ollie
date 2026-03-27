@@ -126,16 +126,80 @@ class OptionsDataFetcher:
 
         return result
 
+    @staticmethod
+    def _bs_call_price(S, K, T, r, sigma):
+        """Black-Scholes call price."""
+        from scipy.stats import norm as _norm
+        if T <= 0 or sigma <= 0:
+            return max(S - K, 0)
+        d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+        d2 = d1 - sigma * np.sqrt(T)
+        return S * _norm.cdf(d1) - K * np.exp(-r * T) * _norm.cdf(d2)
+
+    @staticmethod
+    def _bs_put_price(S, K, T, r, sigma):
+        """Black-Scholes put price."""
+        from scipy.stats import norm as _norm
+        if T <= 0 or sigma <= 0:
+            return max(K - S, 0)
+        d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+        d2 = d1 - sigma * np.sqrt(T)
+        return K * np.exp(-r * T) * _norm.cdf(-d2) - S * _norm.cdf(-d1)
+
+    @staticmethod
+    def _implied_vol(price, S, K, T, r, opt_type='call', fallback=0.5):
+        """Invert Black-Scholes via bisection to get real IV from market price."""
+        if T <= 0 or price <= 0:
+            return fallback
+        lo, hi = 0.01, 5.0
+        for _ in range(60):
+            mid = (lo + hi) / 2
+            if opt_type == 'call':
+                d1 = (np.log(S / K) + (r + 0.5 * mid**2) * T) / (mid * np.sqrt(T))
+                d2 = d1 - mid * np.sqrt(T)
+                from scipy.stats import norm as _norm
+                theo = S * _norm.cdf(d1) - K * np.exp(-r * T) * _norm.cdf(d2)
+            else:
+                d1 = (np.log(S / K) + (r + 0.5 * mid**2) * T) / (mid * np.sqrt(T))
+                d2 = d1 - mid * np.sqrt(T)
+                from scipy.stats import norm as _norm
+                theo = K * np.exp(-r * T) * _norm.cdf(-d2) - S * _norm.cdf(-d1)
+            if abs(theo - price) < 0.001:
+                return round(mid, 4)
+            if theo < price:
+                lo = mid
+            else:
+                hi = mid
+        return round((lo + hi) / 2, 4)
+
     def _enrich_greeks(self, df: pd.DataFrame, stock_price: float, dte: int) -> pd.DataFrame:
-        """Estimate Greeks using Black-Scholes when not provided by data source."""
+        """Estimate Greeks using Black-Scholes. Derives IV from lastPrice when yfinance IV is unreliable."""
         T = dte / 365.0
         r = 0.05  # Risk-free rate approximation
 
         for idx, row in df.iterrows():
             K = row['strike']
-            sigma = row.get('impliedVolatility', 0.3)
-            if sigma <= 0 or pd.isna(sigma):
-                sigma = 0.3
+            yf_sigma = float(row.get('impliedVolatility', 0) or 0)
+            last_px = float(row.get('lastPrice', 0) or 0)
+            opt_type = row.get('option_type', 'call')
+
+            # Validate yfinance IV by checking if its theoretical price is within 50% of
+            # the actual last traded price. yfinance commonly returns garbage IV (e.g. 0.03
+            # or 0.12 for a stock with 60% HV) that produces wildly wrong delta/prob values.
+            sigma = None
+            if yf_sigma > 0.05 and T > 0 and last_px > 0:
+                if opt_type == 'call':
+                    theo = self._bs_call_price(stock_price, K, T, r, yf_sigma)
+                else:
+                    theo = self._bs_put_price(stock_price, K, T, r, yf_sigma)
+                if theo > 0 and abs(theo - last_px) / last_px < 0.50:
+                    sigma = yf_sigma  # yfinance IV matches market price — use it
+
+            if sigma is None and last_px > 0 and T > 0:
+                sigma = self._implied_vol(last_px, stock_price, K, T, r, opt_type)
+
+            if sigma is None or sigma <= 0:
+                sigma = 0.50  # last resort
 
             try:
                 d1 = (np.log(stock_price / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
@@ -152,12 +216,23 @@ class OptionsDataFetcher:
                 theta = -(stock_price * norm.pdf(d1) * sigma) / (2 * np.sqrt(T)) / 365
                 vega = stock_price * norm.pdf(d1) * np.sqrt(T) / 100
 
+                prob_itm_val = round(prob_itm, 4)
+                prob_otm_val = round(1 - prob_itm, 4)
+
+                # Prob of Touch ≈ 2 × Prob ITM (tastytrade / TastyWorks convention).
+                # Intuition: a 30% Prob ITM option has roughly a 60% chance of touching
+                # the strike *at some point* before expiry even if it ultimately expires OTM.
+                # Used primarily for stop-loss trigger decisions.
+                prob_touch_val = round(min(2 * prob_itm_val, 0.99), 4)
+
                 df.at[idx, 'delta_est'] = round(delta, 4)
                 df.at[idx, 'gamma_est'] = round(gamma, 6)
                 df.at[idx, 'theta_est'] = round(theta, 4)
                 df.at[idx, 'vega_est'] = round(vega, 4)
-                df.at[idx, 'prob_itm'] = round(prob_itm, 4)
-                df.at[idx, 'prob_otm'] = round(1 - prob_itm, 4)
+                df.at[idx, 'prob_itm'] = prob_itm_val
+                df.at[idx, 'prob_otm'] = prob_otm_val
+                df.at[idx, 'prob_touch'] = prob_touch_val
+                df.at[idx, 'iv_used'] = round(sigma, 4)  # store back-solved IV for POP calcs
             except (ZeroDivisionError, ValueError):
                 df.at[idx, 'delta_est'] = 0
                 df.at[idx, 'gamma_est'] = 0
@@ -165,6 +240,8 @@ class OptionsDataFetcher:
                 df.at[idx, 'vega_est'] = 0
                 df.at[idx, 'prob_itm'] = 0
                 df.at[idx, 'prob_otm'] = 1
+                df.at[idx, 'prob_touch'] = 0
+                df.at[idx, 'iv_used'] = sigma if sigma else 0.50
 
         return df
 
@@ -187,31 +264,63 @@ class OptionsDataFetcher:
                 earnings[sym] = None
         return earnings
 
-    def get_iv_rank(self, symbol: str, lookback_days: int = 252) -> float:
+    def get_iv_rank(self, symbol: str, lookback_days: int = 63,
+                    current_iv: float = None) -> dict:
         """
-        Calculate IV Rank: where current IV sits relative to past year's range.
-        IV Rank = (Current IV - 52w Low IV) / (52w High IV - 52w Low IV)
-        Uses HV as proxy when real IV history isn't available.
+        Calculate IV Rank over a 3-month window and Volatility Risk Premium.
+
+        Uses real ATM implied volatility (current_iv) when provided by the caller
+        (extracted from the live options chain). Falls back to current HV30 when
+        no live IV is available — but still uses the shorter 63-day window so
+        post-IPO volatility spikes don't inflate the range.
+
+        Returns a dict:
+          iv_rank   — 0-100 percentile of current IV in its 63-day range
+          hv30      — current 30-day historical volatility (annualised, 0-100)
+          current_iv — the IV used for ranking (real ATM IV or HV proxy), 0-100
+          vrop      — Volatility Risk Premium = current_iv - hv30 (percentage points)
+                      Positive = IV > realised vol → selling premium is attractive
         """
         ticker = yf.Ticker(symbol)
-        hist = ticker.history(period='1y')
+        # Fetch ~5 months so we have enough history for a 63-day rolling window
+        hist = ticker.history(period='5mo')
         if hist.empty or len(hist) < 30:
-            return 0.5
+            return {'iv_rank': 50.0, 'hv30': 0.0, 'current_iv': 0.0, 'vrop': 0.0}
 
-        # Use rolling 30-day HV as IV proxy
         returns = np.log(hist['Close'] / hist['Close'].shift(1)).dropna()
-        rolling_vol = returns.rolling(window=30).std() * np.sqrt(252)
-        rolling_vol = rolling_vol.dropna()
 
-        if rolling_vol.empty:
-            return 0.5
+        # HV30: rolling 30-day realised vol, annualised
+        rolling_hv = returns.rolling(window=30).std() * np.sqrt(252)
+        rolling_hv = rolling_hv.dropna()
 
-        current_vol = rolling_vol.iloc[-1]
-        min_vol = rolling_vol.min()
-        max_vol = rolling_vol.max()
+        if rolling_hv.empty:
+            return {'iv_rank': 50.0, 'hv30': 0.0, 'current_iv': 0.0, 'vrop': 0.0}
+
+        hv30_current = round(rolling_hv.iloc[-1] * 100, 2)  # as %
+
+        # The value we rank: real ATM IV if caller supplies it, else HV proxy
+        if current_iv and current_iv > 0:
+            rank_value = current_iv / 100.0   # caller passes as %, convert to decimal
+        else:
+            rank_value = rolling_hv.iloc[-1]
+            current_iv = hv30_current         # report what we used
+
+        # IV rank over the 63-day rolling HV range (3-month window)
+        window = rolling_hv.tail(lookback_days)
+        min_vol = window.min()
+        max_vol = window.max()
 
         if max_vol == min_vol:
-            return 0.5
+            iv_rank_val = 0.5
+        else:
+            iv_rank_val = (rank_value - min_vol) / (max_vol - min_vol)
+            iv_rank_val = max(0.0, min(1.0, iv_rank_val))
 
-        iv_rank = (current_vol - min_vol) / (max_vol - min_vol)
-        return round(max(0, min(1, iv_rank)), 4)
+        vrop = round(current_iv - hv30_current, 2)   # IV - HV, in pp
+
+        return {
+            'iv_rank':    round(iv_rank_val * 100, 1),
+            'hv30':       hv30_current,
+            'current_iv': round(current_iv, 2),
+            'vrop':       vrop,
+        }

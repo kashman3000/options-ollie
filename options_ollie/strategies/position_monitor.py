@@ -21,6 +21,7 @@ from typing import List, Optional, Dict, Any
 import yfinance as yf
 import numpy as np
 from scipy.stats import norm
+from scipy.optimize import brentq
 
 from .trade_ledger import TradeLedger, Trade, TradeType, TradeStatus
 
@@ -136,6 +137,17 @@ class PositionMonitor:
 
         # ── Live option price (for options positions) ─────────────────────
         if trade.trade_type != TradeType.LONG_SHARES and trade.expiry and snap.current_price:
+            # Calculate actual entry DTE from trade dates so the time-decay
+            # fallback uses the real holding period, not a hardcoded 45-day guess.
+            entry_dte = None
+            if trade.entry_date and trade.expiry:
+                try:
+                    entry_dt = datetime.strptime(trade.entry_date, '%Y-%m-%d')
+                    expiry_dt = datetime.strptime(trade.expiry, '%Y-%m-%d')
+                    entry_dte = max((expiry_dt - entry_dt).days, 1)
+                except ValueError:
+                    pass
+
             snap.current_option_price = self._fetch_option_mid(
                 symbol=trade.symbol,
                 expiry=trade.expiry,
@@ -147,6 +159,7 @@ class PositionMonitor:
                 current_price=snap.current_price,
                 dte=snap.dte,
                 entry_price=trade.entry_price,
+                entry_dte=entry_dte,
             )
 
         # ── Unrealized P&L ────────────────────────────────────────────────
@@ -193,7 +206,8 @@ class PositionMonitor:
                           short_call_strike: Optional[float],
                           short_put_strike: Optional[float],
                           current_price: float, dte: Optional[int],
-                          entry_price: float) -> float:
+                          entry_price: float,
+                          entry_dte: Optional[int] = None) -> float:
         """
         Try to fetch the current mid price of the option from yfinance.
         Falls back to a time-decay estimate if the chain isn't available.
@@ -205,46 +219,230 @@ class PositionMonitor:
             if trade_type in (TradeType.CSP, TradeType.BULL_PUT_SPREAD):
                 df = chain.puts
                 target_strike = short_put_strike or strike
+                is_call = False
             elif trade_type in (TradeType.COVERED_CALL, TradeType.BEAR_CALL_SPREAD):
                 df = chain.calls
                 target_strike = short_call_strike or strike
+                is_call = True
             elif trade_type == TradeType.IRON_CONDOR:
-                # For iron condors, estimate as sum of both short legs
-                put_mid = self._chain_mid(chain.puts, short_put_strike)
-                call_mid = self._chain_mid(chain.calls, short_call_strike)
-                return round(put_mid + call_mid, 2)
+                # Live bid/ask first
+                put_mid = self._chain_bid_ask_mid(chain.puts, short_put_strike)
+                call_mid = self._chain_bid_ask_mid(chain.calls, short_call_strike)
+                if round(put_mid + call_mid, 2) > 0:
+                    return round(put_mid + call_mid, 2)
+                # BS with cross-expiry IV
+                bs_put = self._bs_from_chain(chain.puts, short_put_strike, current_price, dte, False, symbol)
+                bs_call = self._bs_from_chain(chain.calls, short_call_strike, current_price, dte, True, symbol)
+                if round(bs_put + bs_call, 2) > 0:
+                    return round(bs_put + bs_call, 2)
+                # lastPrice fallback
+                lp = self._chain_last_price(chain.puts, short_put_strike)
+                lc = self._chain_last_price(chain.calls, short_call_strike)
+                if round(lp + lc, 2) > 0:
+                    return round(lp + lc, 2)
+                return self._estimate_current_price(entry_price, dte, entry_dte)
             else:
                 df = chain.puts if option_type == 'put' else chain.calls
                 target_strike = strike
+                is_call = (option_type == 'call')
 
-            return self._chain_mid(df, target_strike)
+            # 1. Live bid/ask mid — only available when market is open
+            mid = self._chain_bid_ask_mid(df, target_strike)
+            if mid > 0:
+                return mid
+
+            # 2. Black-Scholes with cross-expiry implied vol — more accurate than
+            #    a stale lastPrice when the stock has moved since the last trade.
+            bs_price = self._bs_from_chain(df, target_strike, current_price, dte, is_call, symbol)
+            if bs_price > 0:
+                return bs_price
+
+            # 3. lastPrice — stale but better than nothing
+            last = self._chain_last_price(df, target_strike)
+            if last > 0:
+                return last
+
+            # 4. Last resort: sqrt-of-time decay model
+            return self._estimate_current_price(entry_price, dte, entry_dte)
 
         except Exception:
             # Fallback: estimate using simple time-decay model
-            return self._estimate_current_price(entry_price, dte)
+            return self._estimate_current_price(entry_price, dte, entry_dte)
 
     def _chain_mid(self, df, strike: Optional[float]) -> float:
-        """Find mid price for a given strike in a chain DataFrame."""
+        """Legacy combined helper — returns bid/ask mid, then lastPrice."""
+        mid = self._chain_bid_ask_mid(df, strike)
+        return mid if mid > 0 else self._chain_last_price(df, strike)
+
+    def _chain_bid_ask_mid(self, df, strike: Optional[float]) -> float:
+        """Return (bid+ask)/2 only. Returns 0.0 when market is closed."""
         if df is None or df.empty or strike is None:
             return 0.0
         try:
             row = df.iloc[(df['strike'] - strike).abs().argsort()[:1]]
             bid = float(row['bid'].iloc[0])
             ask = float(row['ask'].iloc[0])
-            return round((bid + ask) / 2, 2)
+            mid = round((bid + ask) / 2, 2)
+            return mid if mid > 0 else 0.0
         except Exception:
             return 0.0
 
-    def _estimate_current_price(self, entry_price: float, dte: Optional[int]) -> float:
+    def _chain_last_price(self, df, strike: Optional[float]) -> float:
+        """Return lastPrice for the nearest strike. May be stale outside market hours."""
+        if df is None or df.empty or strike is None:
+            return 0.0
+        try:
+            row = df.iloc[(df['strike'] - strike).abs().argsort()[:1]]
+            if 'lastPrice' in row.columns:
+                last = float(row['lastPrice'].iloc[0])
+                return round(last, 2) if last > 0 else 0.0
+            return 0.0
+        except Exception:
+            return 0.0
+
+    def _bs_from_chain(self, df, strike: Optional[float], current_price: float,
+                       dte: Optional[int], is_call: bool,
+                       symbol: Optional[str] = None) -> float:
+        """
+        Estimate option price using Black-Scholes.
+
+        Volatility priority:
+          1. Chain impliedVolatility — if it looks realistic (> 10%)
+          2. 30-day historical volatility from price history — always live,
+             used when chain IV is stale/zero (common outside market hours)
+        """
+        if df is None or df.empty or strike is None or not current_price or not dte or dte <= 0:
+            return 0.0
+        try:
+            row = df.iloc[(df['strike'] - strike).abs().argsort()[:1]]
+            iv = float(row['impliedVolatility'].iloc[0]) if 'impliedVolatility' in row.columns else 0.0
+
+            # Chain IV below 10% on an individual stock is almost certainly stale data.
+            # Back-solve a better IV from high-volume near-ATM options instead.
+            if np.isnan(iv) or iv < 0.10:
+                iv = self._get_vol_estimate(symbol, current_price, is_call) if symbol else 0.0
+
+            if iv <= 0:
+                return 0.0
+
+            S = current_price
+            K = float(row['strike'].iloc[0])
+            T = dte / 365.0
+            r = 0.05
+            d1 = (np.log(S / K) + (r + 0.5 * iv ** 2) * T) / (iv * np.sqrt(T))
+            d2 = d1 - iv * np.sqrt(T)
+            if is_call:
+                price = S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+            else:
+                price = K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+            return round(max(float(price), 0.01), 2)
+        except Exception:
+            return 0.0
+
+    def _get_vol_estimate(self, symbol: str, current_price: float,
+                          is_call: bool = True) -> float:
+        """
+        Best available volatility estimate for Black-Scholes pricing.
+
+        Strategy:
+        1. Back-solve IV from near-ATM options on the nearest liquid expiry
+           (7–45 DTE), preferring the same option side (calls for call pricing)
+           to avoid put/call skew distortion.
+        2. Fall back to 30-day historical volatility if no liquid data found.
+        """
+        def bs_price_fn(S, K, T, r, sig, call):
+            if sig <= 0 or T <= 0: return 0.0
+            d1 = (np.log(S / K) + (r + 0.5 * sig ** 2) * T) / (sig * np.sqrt(T))
+            d2 = d1 - sig * np.sqrt(T)
+            if call:
+                return S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+            return K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+
+        try:
+            ticker = yf.Ticker(symbol)
+            today = datetime.now()
+            nearby = [
+                e for e in ticker.options
+                if 7 <= (datetime.strptime(e, '%Y-%m-%d') - today).days <= 45
+            ]
+            if not nearby:
+                raise ValueError("no nearby expiries")
+
+            r = 0.05
+            S = current_price
+            ivs = []
+
+            for exp in nearby[:3]:
+                T = (datetime.strptime(exp, '%Y-%m-%d') - today).days / 365.0
+                if T <= 0:
+                    continue
+                chain = ticker.option_chain(exp)
+
+                # Prefer same side as the option being priced (less skew distortion).
+                # OTM only: calls above current price, puts below current price.
+                if is_call:
+                    candidates = chain.calls[
+                        chain.calls['strike'].between(current_price * 0.98, current_price * 1.08)
+                        & (chain.calls['lastPrice'] > 0.10)
+                        & (chain.calls['volume'] > 0)
+                    ]
+                    side_is_call = True
+                else:
+                    candidates = chain.puts[
+                        chain.puts['strike'].between(current_price * 0.92, current_price * 1.02)
+                        & (chain.puts['lastPrice'] > 0.10)
+                        & (chain.puts['volume'] > 0)
+                    ]
+                    side_is_call = False
+
+                for _, row in candidates.iterrows():
+                    K = float(row['strike'])
+                    last = float(row['lastPrice'])
+                    try:
+                        iv = brentq(
+                            lambda sig: bs_price_fn(S, K, T, r, sig, side_is_call) - last,
+                            0.05, 5.0, xtol=1e-4
+                        )
+                        ivs.append(iv)
+                    except Exception:
+                        continue
+
+                if ivs:
+                    break
+
+            if ivs:
+                return round(float(np.median(ivs)), 4)
+
+        except Exception:
+            pass
+
+        # ── Fallback: 30-day historical volatility ─────────────────────
+        try:
+            hist = yf.Ticker(symbol).history(period='35d')
+            if len(hist) < 5:
+                return 0.0
+            closes = hist['Close'].tail(31)
+            log_returns = np.log(closes / closes.shift(1)).dropna()
+            hv = float(log_returns.std() * np.sqrt(252))
+            return round(hv, 4) if hv > 0 else 0.0
+        except Exception:
+            return 0.0
+
+    def _estimate_current_price(self, entry_price: float, dte: Optional[int],
+                                entry_dte: Optional[int] = None) -> float:
         """
         Rough time-decay estimate when live chain data isn't available.
         Uses sqrt-of-time model (theta decays faster near expiry).
-        Assumes 45 DTE at entry as baseline.
+
+        entry_dte: the DTE at the time the trade was opened (calculated from
+                   trade.entry_date and trade.expiry). Falls back to 45 if unknown.
         """
         if not entry_price or dte is None or dte <= 0:
             return 0.0
-        entry_dte = 45
-        ratio = (dte / entry_dte) ** 0.5
+        baseline_dte = entry_dte if (entry_dte and entry_dte > 0) else 45
+        # Clamp: current DTE can't exceed the baseline
+        effective_dte = min(dte, baseline_dte)
+        ratio = (effective_dte / baseline_dte) ** 0.5
         return round(entry_price * ratio, 2)
 
     # ── Internal: generate advice ─────────────────────────────────────────

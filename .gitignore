@@ -18,7 +18,8 @@ env/
 
 # Data / trade ledger (contains personal trade data — do not commit)
 data/trade_ledger.json
-data/*.json
+data/portfolio.json
+# latest_scan.json excluded above — but my_holdings.json IS committed (user config)
 
 # Scan output cache
 latest_scan.json
