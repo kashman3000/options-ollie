@@ -12,6 +12,30 @@ from .fetcher import OptionsDataFetcher
 from ..config import RiskProfile, FULL_WATCHLIST
 
 
+# ── Shared IV helpers ────────────────────────────────────────────────────────
+
+def _extract_atm_iv(chain: 'pd.DataFrame', price: float) -> 'Optional[float]':
+    """
+    Extract a robust ATM implied volatility estimate from an options chain.
+    Takes the median IV of all strikes within ±10% of current price, filtering
+    out junk yfinance values (< 5% or > 300%). Returns None if no valid data.
+    """
+    if chain.empty or 'impliedVolatility' not in chain.columns:
+        return None
+    try:
+        band = price * 0.10
+        near_atm = chain[
+            (chain['strike'] >= price - band) &
+            (chain['strike'] <= price + band)
+        ]['impliedVolatility'].dropna()
+        near_atm = near_atm[(near_atm >= 0.05) & (near_atm <= 3.0)]
+        if not near_atm.empty:
+            return round(float(near_atm.median()) * 100, 2)
+    except Exception:
+        pass
+    return None
+
+
 # ── Probability helpers ───────────────────────────────────────────────────────
 
 def _iv_rank_label(iv_rank: float) -> str:
@@ -165,16 +189,7 @@ class OptionsScreener:
 
                 # Extract ATM implied volatility from the live chain so get_iv_rank
                 # uses real IV (not HV proxy) for a meaningful VRP calculation.
-                atm_iv = None
-                if 'impliedVolatility' in chain.columns:
-                    try:
-                        chain['_strike_dist'] = (chain['strike'] - info['price']).abs()
-                        atm_row = chain.sort_values('_strike_dist').iloc[0]
-                        raw_iv  = atm_row.get('impliedVolatility', 0)
-                        if raw_iv and float(raw_iv) > 0:
-                            atm_iv = round(float(raw_iv) * 100, 2)  # yfinance returns 0-1
-                    except Exception:
-                        pass
+                atm_iv = _extract_atm_iv(chain, info['price'])
 
                 iv_data    = self.fetcher.get_iv_rank(sym, current_iv=atm_iv)
                 iv_rank    = iv_data['iv_rank'] / 100.0   # 0-1 for internal calcs
@@ -356,7 +371,6 @@ class OptionsScreener:
         if not info:
             return pd.DataFrame()
 
-        iv_rank = self.fetcher.get_iv_rank(symbol)['iv_rank'] / 100.0
         cost_basis = avg_cost or info['price']
         chain = self.fetcher.get_options_chain(
             symbol,
@@ -366,6 +380,9 @@ class OptionsScreener:
 
         if chain.empty:
             return pd.DataFrame()
+
+        atm_iv = _extract_atm_iv(chain, info['price'])
+        iv_rank = self.fetcher.get_iv_rank(symbol, current_iv=atm_iv)['iv_rank'] / 100.0
 
         num_contracts = shares // 100
 
@@ -460,16 +477,17 @@ class OptionsScreener:
                 if not info:
                     continue
 
-                iv_rank = self.fetcher.get_iv_rank(sym)['iv_rank'] / 100.0
-                if iv_rank < 0.30:  # Only sell condors when IV is elevated
-                    continue
-
                 chain = self.fetcher.get_options_chain(
                     sym,
                     min_dte=self.risk.min_days_to_expiry,
                     max_dte=self.risk.max_days_to_expiry
                 )
                 if chain.empty:
+                    continue
+
+                atm_iv = _extract_atm_iv(chain, info['price'])
+                iv_rank = self.fetcher.get_iv_rank(sym, current_iv=atm_iv)['iv_rank'] / 100.0
+                if iv_rank < 0.30:  # Only sell condors when IV is elevated
                     continue
 
                 price = info['price']
@@ -590,7 +608,6 @@ class OptionsScreener:
                 if not info:
                     continue
 
-                iv_rank = self.fetcher.get_iv_rank(sym)['iv_rank'] / 100.0
                 chain = self.fetcher.get_options_chain(
                     sym,
                     min_dte=self.risk.min_days_to_expiry,
@@ -600,6 +617,8 @@ class OptionsScreener:
                     continue
 
                 price = info['price']
+                atm_iv = _extract_atm_iv(chain, price)
+                iv_rank = self.fetcher.get_iv_rank(sym, current_iv=atm_iv)['iv_rank'] / 100.0
                 opt_type = 'put' if spread_type == 'put' else 'call'
                 options = chain[chain['option_type'] == opt_type].copy()
 

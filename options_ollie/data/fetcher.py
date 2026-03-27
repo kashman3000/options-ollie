@@ -264,7 +264,7 @@ class OptionsDataFetcher:
                 earnings[sym] = None
         return earnings
 
-    def get_iv_rank(self, symbol: str, lookback_days: int = 63,
+    def get_iv_rank(self, symbol: str, lookback_days: int = 252,
                     current_iv: float = None) -> dict:
         """
         Calculate IV Rank over a 3-month window and Volatility Risk Premium.
@@ -282,8 +282,11 @@ class OptionsDataFetcher:
                       Positive = IV > realised vol → selling premium is attractive
         """
         ticker = yf.Ticker(symbol)
-        # Fetch ~5 months so we have enough history for a 63-day rolling window
-        hist = ticker.history(period='5mo')
+        # Fetch 14 months so we have a full 252-day (1-year) rolling HV window.
+        # A 1-year range matches how Menthorq and most professional platforms
+        # define IV rank (52-week high/low), and avoids short-window distortion
+        # from recent vol spikes (e.g. tariff selloffs compressing the rank to 0).
+        hist = ticker.history(period='14mo')
         if hist.empty or len(hist) < 30:
             return {'iv_rank': 50.0, 'hv30': 0.0, 'current_iv': 0.0, 'vrop': 0.0}
 
@@ -305,7 +308,7 @@ class OptionsDataFetcher:
             rank_value = rolling_hv.iloc[-1]
             current_iv = hv30_current         # report what we used
 
-        # IV rank over the 63-day rolling HV range (3-month window)
+        # IV rank over the 252-day rolling HV range (52-week window)
         window = rolling_hv.tail(lookback_days)
         min_vol = window.min()
         max_vol = window.max()

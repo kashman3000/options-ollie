@@ -137,17 +137,9 @@ class WheelManager:
             chain_df = self.fetcher.get_options_chain(symbol, min_dte=20, max_dte=60)
 
             # Extract ATM implied volatility from the live options chain so
-            # get_iv_rank uses real IV (not just HV as proxy)
-            atm_iv = None
-            if not chain_df.empty and 'impliedVolatility' in chain_df.columns:
-                try:
-                    chain_df['strike_dist'] = (chain_df['strike'] - current_price).abs()
-                    atm_row = chain_df.sort_values('strike_dist').iloc[0]
-                    raw_iv = atm_row.get('impliedVolatility', 0)
-                    if raw_iv and raw_iv > 0:
-                        atm_iv = round(float(raw_iv) * 100, 2)  # yfinance returns 0-1 decimal
-                except Exception:
-                    pass
+            # get_iv_rank uses real IV (not just HV as proxy).
+            from ..data.screener import _extract_atm_iv
+            atm_iv = _extract_atm_iv(chain_df, current_price)
 
             iv_data = self.fetcher.get_iv_rank(symbol, current_iv=atm_iv)
             iv_rank_pct = iv_data['iv_rank']   # already 0-100

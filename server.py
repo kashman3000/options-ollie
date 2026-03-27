@@ -1147,7 +1147,7 @@ function buildHoldingCardHtml(r){
       </tr>`;
     }).join('');
     const coachBlock=ccCoaching?`<div class="coaching-annotation"><div class="coach-label">Ollie's take</div>${ccCoaching}</div>`:'';
-    ccHtml=`${coachBlock}<div style="font-size:12px;color:var(--muted);margin-bottom:6px">IV: <span style="color:${ivTierColor};font-weight:600">${ivTier}</span> (${r.iv_rank||'—'}%) — ${ivLabel}</div>
+    ccHtml=`${coachBlock}<div style="font-size:12px;color:var(--muted);margin-bottom:6px">IV: <span style="color:${ivTierColor};font-weight:600">${ivTier}</span> (${r.iv_rank??'—'}%) — ${ivLabel}</div>
     <div class="tbl-wrap"><table><thead><tr>
       <th>Strike</th><th>Expiry</th><th>DTE</th><th>Mid</th><th>Total $</th><th>Prob OTM</th><th>POP ↑</th><th>P.Touch ↓</th><th>Upside</th><th>Ann Ret</th><th></th>
     </tr></thead><tbody>${rows}</tbody></table></div>`;
@@ -1259,7 +1259,7 @@ function buildHoldingCardHtml(r){
   <div class="stats-row" style="margin-bottom:14px">
     <div class="stat"><div class="lbl">Price</div><div class="val">$${r.current_price||'—'}</div></div>
     <div class="stat"><div class="lbl">Shares</div><div class="val">${r.shares_held||0}</div></div>
-    ${!isAsx?`<div class="stat"><div class="lbl">IV Rank</div><div class="val ${ivC}">${r.iv_rank||'—'}%</div></div>`:''}
+    ${!isAsx?`<div class="stat"><div class="lbl">IV Rank</div><div class="val ${ivC}">${r.iv_rank??'—'}%</div></div>`:''}
     <div class="stat"><div class="lbl">Value</div><div class="val">$${(ra.position_value||0).toLocaleString('en-AU',{maximumFractionDigits:0})}</div></div>
     <div class="stat"><div class="lbl">P&L</div><div class="val ${pnlColor}">${pnl>=0?'+':''}$${Math.abs(pnl).toLocaleString('en-AU',{maximumFractionDigits:0})}</div></div>
     ${r.cost_basis?`<div class="stat"><div class="lbl">Avg Cost</div><div class="val">$${r.cost_basis}</div></div>`:''}
@@ -1943,6 +1943,14 @@ function renderWheelPick(rows){
   else
     vrpNote = `⚠️ VRP is <strong>${vrop.toFixed(1)}pp</strong> (IV ${p.current_iv}% vs HV30 ${p.hv30}%) — IV is below realised vol, meaning the market is under-pricing risk. The selling edge is limited; size conservatively.`;
 
+  const premium = p.premium_100 || 0;
+  const capitalReq = p.capital_required || 0;
+  const popFrac = (p.pop || 0) / 100;
+  const ev = premium * popFrac;                          // expected value per contract
+  const evPerDay = p.dte > 0 ? ev / p.dte : 0;          // expected $ per day tied up
+  const yieldPct = capitalReq > 0 ? (premium / capitalReq * 100).toFixed(2) : '—';
+  const evColor = ev >= 150 ? 'var(--green)' : ev >= 75 ? 'var(--blue)' : 'var(--orange)';
+
   const narrative=`<div class="pick-coach-label">🤖 Why Ollie picked this</div>
 <p>You collect <strong>$${premium.toFixed(0)}</strong> upfront. With a ${p.pop}% probability of profit,
 the statistically expected gain is <strong>~$${ev.toFixed(0)} per contract</strong> — or roughly
@@ -1962,14 +1970,6 @@ collect meaningful premium. ${vrpNote}</p>`;
   <div class="pick-why-item"><div class="wi-title">Liquidity (10%)</div><div class="wi-body">A wide bid-ask spread is a hidden tax you pay on every trade. If the spread is $0.50, you're immediately down $50/contract at fill. Tight spreads + high OI mean you can enter and exit cleanly.</div></div>
   <div class="pick-why-item"><div class="wi-title">Strike Selection (5%)</div><div class="wi-body">The 0.20–0.30 delta range (70–80% chance of expiring worthless) is the professional sweet spot. Below 0.15 delta: premium too thin to bother. Above 0.35 delta: assignment risk becomes the dominant concern.</div></div>
 </div></details>`;
-
-  const premium = p.premium_100 || 0;
-  const capitalReq = p.capital_required || 0;
-  const popFrac = (p.pop || 0) / 100;
-  const ev = premium * popFrac;                          // expected value per contract
-  const evPerDay = p.dte > 0 ? ev / p.dte : 0;          // expected $ per day tied up
-  const yieldPct = capitalReq > 0 ? (premium / capitalReq * 100).toFixed(2) : '—';
-  const evColor = ev >= 150 ? 'var(--green)' : ev >= 75 ? 'var(--blue)' : 'var(--orange)';
 
   el.innerHTML=`<div class="pick-card">
   <div class="pick-header">
