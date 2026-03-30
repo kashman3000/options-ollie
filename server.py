@@ -73,13 +73,18 @@ def save_holdings(holdings):
         json.dump(holdings, f, indent=2)
 
 def load_config():
+    cfg = {}
     if os.path.exists(CONFIG_PATH):
         try:
             with open(CONFIG_PATH) as f:
-                return json.load(f)
+                cfg = json.load(f)
         except Exception:
             pass
-    return {}
+    # Environment variable takes precedence over stored key
+    env_key = os.environ.get('GOOGLE_API_KEY', '').strip()
+    if env_key:
+        cfg['gemini_key'] = env_key
+    return cfg
 
 def save_config(cfg):
     with open(CONFIG_PATH, 'w') as f:
@@ -179,13 +184,17 @@ def get_wheel_cycle_summary(symbol: str) -> dict:
             except Exception:
                 pass
         pct_captured = None
-        if t.premium_received > 0 and dte is not None:
-            # rough theta-based estimate: at 7 DTE ~70% of value decayed
-            # We don't have live market price, so use DTE-based proxy
-            original_dte = t.days_held() + (dte or 0)
-            if original_dte > 0:
-                pct_elapsed = t.days_held() / original_dte
-                pct_captured = round(min(pct_elapsed * 100, 99), 0)
+        if t.premium_received > 0 and dte is not None and dte >= 0:
+            # Use the same sqrt-of-time decay model as PositionMonitor so both
+            # tabs always show the same number for the same position.
+            # ratio = sqrt(dte / original_dte) → remaining option value fraction
+            # pct_captured = (1 - ratio) × 100
+            original_dte = t.days_held() + dte
+            if dte == 0:
+                pct_captured = 99.0
+            elif original_dte > 0:
+                ratio = (dte / original_dte) ** 0.5
+                pct_captured = round(min((1 - ratio) * 100, 99), 0)
         open_cc_list.append({
             'trade_id': t.id,
             'strike': t.strike,
@@ -510,7 +519,10 @@ tr:hover td{background:rgba(255,255,255,.02)}
       <div class="card" style="padding:14px 18px;margin-bottom:16px">
         <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
           <div style="font-size:13px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px">📂 My Holdings</div>
-          <button class="btn btn-primary" style="font-size:12px;padding:6px 14px" onclick="openAddHolding()">＋ Add Stock</button>
+          <div style="display:flex;gap:8px">
+            <button class="btn" id="ibkr-sync-btn" style="font-size:12px;padding:6px 14px;background:#1a3a5c;color:#fff;border:none;border-radius:6px;cursor:pointer" onclick="syncFromIBKR()">🔗 Sync from IBKR</button>
+            <button class="btn btn-primary" style="font-size:12px;padding:6px 14px" onclick="openAddHolding()">＋ Add Stock</button>
+          </div>
         </div>
         <div id="holdings-chips" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px"></div>
       </div>
@@ -556,6 +568,8 @@ tr:hover td{background:rgba(255,255,255,.02)}
         <div class="type-btn" onclick="selType('bull_put',this)"><span class="ico">📐</span>Bull Put Spread</div>
         <div class="type-btn" onclick="selType('bear_call',this)"><span class="ico">📐</span>Bear Call Spread</div>
         <div class="type-btn" onclick="selType('shares',this)"><span class="ico">📦</span>Long Shares</div>
+        <div class="type-btn" onclick="selType('protective_put',this)"><span class="ico">🛡</span>Protective Put<br><small style="font-weight:400;color:var(--muted)">(Hedge)</small></div>
+        <div class="type-btn" onclick="selType('collar',this)"><span class="ico">🔗</span>Collar<br><small style="font-weight:400;color:var(--muted)">(CC + Put)</small></div>
       </div>
       <div class="fg" style="margin-bottom:14px">
         <div class="field"><label>Symbol</label><input type="text" id="f-sym" placeholder="e.g. RDDT" style="text-transform:uppercase"></div>
@@ -597,6 +611,17 @@ tr:hover td{background:rgba(255,255,255,.02)}
         <div class="field"><label>Shares</label><input type="number" id="f-sh" placeholder="100" min="1"></div>
         <div class="field"><label>Cost per Share ($)</label><input type="number" id="f-shc" placeholder="87.50" step="0.01"></div>
       </div>
+      <div id="flds-collar" class="hidden" style="margin-bottom:14px">
+        <div class="fg" style="margin-bottom:10px">
+          <div class="field"><label>Call Strike (sell CC)</label><input type="number" id="f-col-cc" placeholder="110" step="0.5"></div>
+          <div class="field"><label>Put Strike (buy put)</label><input type="number" id="f-col-put" placeholder="95" step="0.5"></div>
+          <div class="field"><label>Expiry</label><input type="date" id="f-col-exp"></div>
+        </div>
+        <div class="fg">
+          <div class="field"><label>CC Premium Received / Contract ($)</label><input type="number" id="f-col-cc-pr" placeholder="2.00" step="0.01"></div>
+          <div class="field"><label>Put Cost / Contract ($)</label><input type="number" id="f-col-put-cost" placeholder="1.20" step="0.01"></div>
+        </div>
+      </div>
       <div class="fg" style="margin-bottom:0">
         <div class="field"><label>Commission ($)</label><input type="number" id="f-com" value="0" step="0.01"></div>
         <div class="field"><label>Notes</label><input type="text" id="f-notes" placeholder="optional"></div>
@@ -612,6 +637,10 @@ tr:hover td{background:rgba(255,255,255,.02)}
 
   <!-- INCOME TAB (F2) -->
   <div id="tab-income" class="tab-content">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;flex-wrap:wrap;gap:10px">
+      <h2 style="font-size:17px">Income Dashboard</h2>
+      <button class="btn btn-ghost" onclick="loadIncome()">↻ Refresh</button>
+    </div>
     <div id="income-wrap">
       <div class="empty"><div class="ico">💰</div><p>Loading income data…</p></div>
     </div>
@@ -1004,9 +1033,7 @@ function buildEarningsBannerHtml(r){
 }
 
 // ── F2: Income Dashboard ───────────────────────────────────────────────────
-let _incomeFetched=false;
 async function loadIncome(){
-  if(_incomeFetched)return;
   const wrap=document.getElementById('income-wrap');
   if(!wrap)return;
   wrap.innerHTML='<div class="empty"><div class="ico">⏳</div><p>Loading income data…</p></div>';
@@ -1015,7 +1042,6 @@ async function loadIncome(){
     const data=await res.json();
     if(data.error){wrap.innerHTML=`<div class="empty"><p>Error: ${data.error}</p></div>`;return}
     renderIncome(data);
-    _incomeFetched=true;
   }catch(e){wrap.innerHTML=`<div class="empty"><p>Error: ${e.message}</p></div>`}
 }
 
@@ -1112,6 +1138,7 @@ function buildNbaCardHtml(nba, r){
 function buildHoldingCardHtml(r){
   const sym=r.symbol||'';
   const isAsx=r.is_asx||false;
+  const cur=r.currency_symbol||'$';   // 'A$' for ASX, '$' for US
   const ivC=(r.iv_rank||0)>40?'pos':'warn';
   const ra=r.risk_analysis||{};
   const nba=r.next_best_action||{};
@@ -1135,8 +1162,8 @@ function buildHoldingCardHtml(r){
       const popColor=popVal>=75?'pos':popVal>=60?'warn':'neg';
       const ptColor=ptVal<=40?'pos':ptVal<=60?'warn':'neg';
       return `<tr>
-        <td><strong>$${c.strike}</strong></td><td>${c.expiry}</td><td>${c.dte}d</td>
-        <td class="pos">$${(c.mid_price||0).toFixed(2)}</td>
+        <td><strong>${cur}${c.strike}</strong></td><td>${c.expiry}</td><td>${c.dte}d</td>
+        <td class="pos">${cur}${(c.mid_price||0).toFixed(2)}</td>
         <td class="pos">$${(c.total_premium||0).toFixed(0)}</td>
         <td>${(c.prob_otm||0).toFixed(0)}%</td>
         <td class="${popColor}" title="Prob of Profit"><strong>${popVal.toFixed(0)}%</strong></td>
@@ -1308,6 +1335,23 @@ async function removeHolding(sym){
   await fetch('/api/holdings/'+sym,{method:'DELETE'});
   showToast(`${sym} removed`,'info');
   runScan();
+}
+
+async function syncFromIBKR(){
+  const btn=document.getElementById('ibkr-sync-btn');
+  btn.disabled=true; btn.textContent='🔄 Syncing…';
+  try{
+    const r=await fetch('/api/ibkr-sync-positions');
+    const data=await r.json();
+    if(data.error){showToast('IBKR sync failed: '+data.error,'error');return;}
+    const added=data.added||[]; const updated=data.updated||[];
+    const msg=[];
+    if(added.length) msg.push(`Added: ${added.join(', ')}`);
+    if(updated.length) msg.push(`Updated: ${updated.join(', ')}`);
+    showToast(msg.length ? msg.join(' | ') : 'Holdings synced from IBKR', 'success');
+    runScan();
+  }catch(e){showToast('IBKR sync error: '+e.message,'error');}
+  finally{btn.disabled=false; btn.textContent='🔗 Sync from IBKR';}
 }
 
 // ── SETTINGS ─────────────────────────────────────────────────────────────
@@ -2159,21 +2203,29 @@ async function saveModal(){
 function selType(t,el){
   selTypeVal=t;
   document.querySelectorAll('.type-btn').forEach(b=>b.classList.remove('selected'));el.classList.add('selected');
-  ['flds-single','flds-ic','flds-spread','flds-shares'].forEach(id=>document.getElementById(id).classList.add('hidden'));
+  ['flds-single','flds-ic','flds-spread','flds-shares','flds-collar'].forEach(id=>document.getElementById(id).classList.add('hidden'));
   document.getElementById('f-ct-wrap').classList.remove('hidden');
   document.getElementById('log-preview').classList.add('hidden');
   document.getElementById('confirm-btn').classList.add('hidden');
-  if(t==='csp'||t==='cc'){document.getElementById('flds-single').classList.remove('hidden');document.getElementById('flds-entry-date').classList.remove('hidden');document.getElementById('f-sk-lbl').textContent=t==='csp'?'Put Strike':'Call Strike'}
+  // Reset label defaults
+  document.getElementById('f-pr-lbl').textContent='Premium / Contract ($)';
+  if(t==='csp'||t==='cc'||t==='protective_put'){
+    document.getElementById('flds-single').classList.remove('hidden');
+    document.getElementById('flds-entry-date').classList.remove('hidden');
+    document.getElementById('f-sk-lbl').textContent=t==='csp'?'Put Strike':t==='protective_put'?'Put Strike (floor)':'Call Strike';
+    document.getElementById('f-pr-lbl').textContent=t==='protective_put'?'Premium Paid / Contract ($)':'Premium Received / Contract ($)';
+  }
   else if(t==='ic')document.getElementById('flds-ic').classList.remove('hidden');
   else if(t==='bull_put'||t==='bear_call'){document.getElementById('flds-spread').classList.remove('hidden');document.getElementById('f-sps-lbl').textContent=t==='bull_put'?'Short Put Strike':'Short Call Strike';document.getElementById('f-spl-lbl').textContent=t==='bull_put'?'Long Put Strike':'Long Call Strike'}
   else if(t==='shares'){document.getElementById('flds-shares').classList.remove('hidden');document.getElementById('f-ct-wrap').classList.add('hidden')}
+  else if(t==='collar'){document.getElementById('flds-collar').classList.remove('hidden');document.getElementById('flds-entry-date').classList.remove('hidden')}
 }
 
 function collectLog(){
   const sym=document.getElementById('f-sym').value.trim().toUpperCase();
   if(!sym){showToast('Enter a symbol','error');return null}
   const base={trade_type:selTypeVal,symbol:sym,contracts:parseInt(document.getElementById('f-ct').value)||1,commission:parseFloat(document.getElementById('f-com').value)||0,notes:document.getElementById('f-notes').value.trim()};
-  if(selTypeVal==='csp'||selTypeVal==='cc'){
+  if(selTypeVal==='csp'||selTypeVal==='cc'||selTypeVal==='protective_put'){
     const strike=parseFloat(document.getElementById('f-sk').value),expiry=document.getElementById('f-exp').value,premium=parseFloat(document.getElementById('f-pr').value),entry_date=document.getElementById('f-entry-date').value||null;
     if(!strike||!expiry||!premium){showToast('Fill Strike, Expiry and Premium','error');return null}
     return{...base,strike,expiry,premium,entry_date};
@@ -2181,6 +2233,11 @@ function collectLog(){
   if(selTypeVal==='ic'){const sp=parseFloat(document.getElementById('f-sp').value),lp=parseFloat(document.getElementById('f-lp').value),sc=parseFloat(document.getElementById('f-sc').value),lc=parseFloat(document.getElementById('f-lc').value),expiry=document.getElementById('f-ic-exp').value,credit=parseFloat(document.getElementById('f-ic-cr').value);if(!sp||!lp||!sc||!lc||!expiry||!credit){showToast('Fill all IC fields','error');return null}return{...base,short_put:sp,long_put:lp,short_call:sc,long_call:lc,expiry,credit}}
   if(selTypeVal==='bull_put'||selTypeVal==='bear_call'){const sps=parseFloat(document.getElementById('f-sps').value),spl=parseFloat(document.getElementById('f-spl').value),expiry=document.getElementById('f-sp-exp').value,credit=parseFloat(document.getElementById('f-sp-cr').value);if(!sps||!spl||!expiry||!credit){showToast('Fill all spread fields','error');return null}return{...base,short_strike:sps,long_strike:spl,expiry,credit}}
   if(selTypeVal==='shares'){const shares=parseInt(document.getElementById('f-sh').value),cost=parseFloat(document.getElementById('f-shc').value);if(!shares||!cost){showToast('Enter shares and cost','error');return null}return{...base,shares,cost_per_share:cost}}
+  if(selTypeVal==='collar'){
+    const cc_strike=parseFloat(document.getElementById('f-col-cc').value),put_strike=parseFloat(document.getElementById('f-col-put').value),expiry=document.getElementById('f-col-exp').value,cc_premium=parseFloat(document.getElementById('f-col-cc-pr').value),put_cost=parseFloat(document.getElementById('f-col-put-cost').value),entry_date=document.getElementById('f-entry-date').value||null;
+    if(!cc_strike||!put_strike||!expiry||!cc_premium||!put_cost){showToast('Fill all Collar fields','error');return null}
+    return{...base,cc_strike,put_strike,expiry,cc_premium,put_cost,entry_date};
+  }
   return null;
 }
 
@@ -2188,11 +2245,14 @@ function previewLog(){
   const d=collectLog();if(!d)return;
   const names={csp:'CSP',cc:'Covered Call',ic:'Iron Condor',bull_put:'Bull Put Spread',bear_call:'Bear Call Spread',shares:'Long Shares',protective_put:'Protective Put',collar:'Collar'};
   let lines=[`<strong>${names[d.trade_type]}</strong> — ${d.symbol}`];
-  if(d.strike)lines.push(`Strike: <strong>$${d.strike}</strong>  |  Expiry: ${d.expiry}`);
-  if(d.premium){const tot=(d.premium*(d.contracts||1)*100).toFixed(2);lines.push(`Premium: <strong>$${d.premium}/contract → $${tot} total received</strong>`)}
+  if(d.strike&&d.trade_type!=='protective_put')lines.push(`Strike: <strong>$${d.strike}</strong>  |  Expiry: ${d.expiry}`);
+  if(d.strike&&d.trade_type==='protective_put')lines.push(`Put floor: <strong>$${d.strike}</strong>  |  Expiry: ${d.expiry}`);
+  if(d.premium&&d.trade_type!=='protective_put'){const tot=(d.premium*(d.contracts||1)*100).toFixed(2);lines.push(`Premium: <strong>$${d.premium}/contract → $${tot} total received</strong>`)}
+  if(d.premium&&d.trade_type==='protective_put'){const tot=(d.premium*(d.contracts||1)*100).toFixed(2);lines.push(`Cost: <strong>$${d.premium}/contract → $${tot} total paid</strong>`)}
   if(d.credit){const tot=(d.credit*(d.contracts||1)*100).toFixed(2);lines.push(`Net credit: <strong>$${d.credit}/contract → $${tot} total received</strong>`)}
   if(d.short_put)lines.push(`Legs: $${d.short_put}P / $${d.short_call}C short  |  $${d.long_put}P / $${d.long_call}C long`);
   if(d.shares)lines.push(`${d.shares} shares @ $${d.cost_per_share} = $${(d.shares*d.cost_per_share).toFixed(2)}`);
+  if(d.cc_strike){const net=d.cc_premium-d.put_cost;const tot=(Math.abs(net)*(d.contracts||1)*100).toFixed(2);lines.push(`Sell $${d.cc_strike}C / Buy $${d.put_strike}P  |  Expiry: ${d.expiry}`);lines.push(`CC premium: $${d.cc_premium} − Put cost: $${d.put_cost} → Net ${net>=0?'credit':'debit'}: <strong>$${Math.abs(net).toFixed(2)}/contract ($${tot} total)</strong>`)}
   if(d.contracts&&d.trade_type!=='shares')lines.push(`Contracts: ${d.contracts}`);
   const box=document.getElementById('log-preview');box.innerHTML=lines.join('<br>');box.classList.remove('hidden');
   document.getElementById('confirm-btn').classList.remove('hidden');
@@ -2204,14 +2264,14 @@ async function confirmLog(){
   try{
     const r=await fetch('/api/log-trade',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});
     const res=await r.json();
-    if(res.success){showToast(`✅ Trade saved! ${res.trade_id} — $${res.premium_received} premium`,'success');resetLog();setTimeout(()=>showTab('positions'),1200)}
+    if(res.success){showToast(`✅ Trade saved! ${res.trade_id} — $${res.premium_received} premium`,'success');resetLog();loadHistory();loadIncome();setTimeout(()=>showTab('positions'),1200)}
     else showToast('Error: '+res.error,'error');
   }catch(e){showToast('Error: '+e.message,'error')}
   finally{btn.disabled=false;btn.innerHTML='✅ Confirm &amp; Save'}
 }
 
 function resetLog(){
-  ['f-sym','f-sk','f-exp','f-pr','f-entry-date','f-sp','f-lp','f-sc','f-lc','f-ic-exp','f-ic-cr','f-sps','f-spl','f-sp-exp','f-sp-cr','f-sh','f-shc','f-notes'].forEach(id=>{const el=document.getElementById(id);if(el)el.value=''});
+  ['f-sym','f-sk','f-exp','f-pr','f-entry-date','f-sp','f-lp','f-sc','f-lc','f-ic-exp','f-ic-cr','f-sps','f-spl','f-sp-exp','f-sp-cr','f-sh','f-shc','f-col-cc','f-col-put','f-col-exp','f-col-cc-pr','f-col-put-cost','f-notes'].forEach(id=>{const el=document.getElementById(id);if(el)el.value=''});
   document.getElementById('flds-entry-date').classList.add('hidden');
   document.getElementById('f-ct').value=1;document.getElementById('f-com').value=0;
   document.getElementById('log-preview').classList.add('hidden');
@@ -2266,7 +2326,7 @@ function closePosition(id,sym){
   const px=prompt(`Close ${id} (${sym})\n\nEnter buy-back price per contract (enter 0 if expired worthless):`,'0.00');
   if(px===null)return;
   const price=parseFloat(px);if(isNaN(price)||price<0){showToast('Invalid price','error');return}
-  fetch('/api/close-trade',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({trade_id:id,exit_price:price})}).then(r=>r.json()).then(res=>{if(res.success){showToast(`Closed! P&L: ${res.realized_pnl>=0?'+':''}$${res.realized_pnl.toFixed(2)}`,'success');runMonitor()}else showToast('Error: '+res.error,'error')});
+  fetch('/api/close-trade',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({trade_id:id,exit_price:price})}).then(r=>r.json()).then(res=>{if(res.success){showToast(`Closed! P&L: ${res.realized_pnl>=0?'+':''}$${res.realized_pnl.toFixed(2)}`,'success');runMonitor();loadHistory();loadIncome()}else showToast('Error: '+res.error,'error')});
 }
 
 // ── HISTORY ────────────────────────────────────────────────────────────
@@ -2370,6 +2430,161 @@ window.addEventListener('load',async()=>{
 @app.route('/')
 def index():
     return render_template_string(HTML)
+
+
+@app.route('/api/ibkr-test')
+def api_ibkr_test():
+    """Diagnostic endpoint — tests IB Gateway connection and reports what's happening."""
+    import asyncio
+    from datetime import date as _date
+
+    result = {'connected': False, 'error': None, 'accounts': [], 'expiries': [], 'qualify_test': None, 'mkt_data_test': None}
+
+    async def _test():
+        from ib_insync import IB, Stock, Option
+        ib = IB()
+        try:
+            await ib.connectAsync('127.0.0.1', 4001, clientId=11, readonly=True, timeout=10)
+            result['connected'] = True
+            result['accounts'] = list(ib.managedAccounts())
+
+            # Qualify ANZ stock
+            stock = Stock('ANZ', 'ASX', 'AUD')
+            contracts = await ib.qualifyContractsAsync(stock)
+            if not contracts:
+                result['error'] = 'ANZ stock did not qualify'
+                return
+            stock = contracts[0]
+
+            # Get option params
+            chains = await ib.reqSecDefOptParamsAsync('ANZ', '', 'STK', stock.conId)
+            if not chains:
+                result['error'] = 'No option chains returned'
+                return
+            chain = next((c for c in chains if c.exchange == 'ASX'), chains[0])
+
+            # Show all expiries with DTE
+            today = _date.today()
+            expiry_info = []
+            for exp in sorted(chain.expirations):
+                exp_date = datetime.strptime(exp, '%Y%m%d').date()
+                dte = (exp_date - today).days
+                expiry_info.append({'expiry': exp, 'dte': dte, 'in_range': 20 <= dte <= 60})
+            result['expiries'] = expiry_info
+            result['strikes_available'] = len(chain.strikes)
+
+            # Try qualifying one option contract near ATM
+            import yfinance as yf
+            price = yf.Ticker('ANZ.AX').history(period='1d')['Close'].iloc[-1]
+            atm_strike = min(chain.strikes, key=lambda s: abs(s - price))
+            valid_expiries = [e for e in expiry_info if e['in_range']]
+            if valid_expiries:
+                exp_str = valid_expiries[0]['expiry']
+                test_opt = Option('ANZ', exp_str, atm_strike, 'C', 'ASX')
+                q = await ib.qualifyContractsAsync(test_opt)
+                result['qualify_test'] = f"ATM call qualified: conId={q[0].conId}, multiplier={q[0].multiplier}" if q else "Failed to qualify test option"
+
+                if q:
+                    # Test market data — use delayed (type 3, free, no subscription needed)
+                    ib.reqMarketDataType(3)
+                    tkr = ib.reqMktData(q[0], '', snapshot=True, regulatorySnapshot=False)
+                    await asyncio.sleep(4)
+                    ib.cancelMktData(q[0])
+                    result['mkt_data_test'] = f"bid={tkr.bid}, ask={tkr.ask}, last={tkr.last}, iv={getattr(tkr.modelGreeks, 'impliedVol', None) if tkr.modelGreeks else None}"
+            else:
+                result['qualify_test'] = 'No expiries in 20-60 DTE range'
+
+        except Exception as e:
+            result['error'] = str(e)
+        finally:
+            ib.disconnect()
+
+    try:
+        asyncio.run(_test())
+    except Exception as e:
+        result['error'] = f"asyncio.run failed: {e}"
+
+    # Also test the full chain fetch — same code path as the app
+    import traceback
+    chain_result = {'steps': []}
+
+    async def _chain_test():
+        from ib_insync import IB, Stock, Option
+        import yfinance as yf
+        ib = IB()
+        try:
+            await ib.connectAsync('127.0.0.1', 4001, clientId=12, readonly=True, timeout=15)
+            chain_result['steps'].append('connected')
+            ib.reqMarketDataType(3)
+
+            stock = Stock('ANZ', 'ASX', 'AUD')
+            q = await ib.qualifyContractsAsync(stock)
+            stock = q[0]
+            chain_result['steps'].append(f'stock qualified conId={stock.conId}')
+
+            chains = await ib.reqSecDefOptParamsAsync(stock.symbol, '', stock.secType, stock.conId)
+            chain = next((c for c in chains if c.exchange == 'ASX'), chains[0])
+            chain_result['steps'].append(f'chain exchange={chain.exchange}, {len(chain.expirations)} expiries')
+
+            today = _date.today()
+            valid = []
+            for exp in sorted(chain.expirations):
+                exp_d = datetime.strptime(exp, '%Y%m%d').date()
+                dte = (exp_d - today).days
+                if 14 <= dte <= 90:
+                    valid.append((exp, exp_d, dte))
+            chain_result['steps'].append(f'{len(valid)} expiries in 14-90 DTE: {[(v[0], v[2]) for v in valid]}')
+
+            price = yf.Ticker('ANZ.AX').history(period='1d')['Close'].iloc[-1]
+            chain_result['steps'].append(f'stock_price={price:.2f}')
+
+            strikes = sorted(chain.strikes)
+            filtered = [s for s in strikes if price * 0.70 <= s <= price * 1.30]
+            chain_result['steps'].append(f'{len(filtered)} strikes in range (of {len(strikes)} total)')
+
+            # Qualify one batch of 10 calls for the first valid expiry
+            if valid and filtered:
+                exp_str = valid[0][0]
+                test_batch = [Option('ANZ', exp_str, float(s), 'C', 'ASX') for s in filtered[:10]]
+                chain_result['steps'].append(f'qualifying {len(test_batch)} contracts for {exp_str}...')
+                qq = await ib.qualifyContractsAsync(*test_batch)
+                good = [c for c in qq if c.conId]
+                chain_result['steps'].append(f'{len(good)} qualified (conIds: {[c.conId for c in good[:3]]})')
+
+                if good:
+                    tkr = ib.reqMktData(good[0], '', snapshot=True, regulatorySnapshot=False)
+                    await asyncio.sleep(4)
+                    ib.cancelMktData(good[0])
+                    iv = getattr(tkr.modelGreeks, 'impliedVol', None) if tkr.modelGreeks else None
+                    chain_result['steps'].append(f'mkt data: bid={tkr.bid} ask={tkr.ask} last={tkr.last} iv={iv}')
+
+        except Exception as e:
+            chain_result['steps'].append(f'ERROR: {e}')
+            chain_result['traceback'] = traceback.format_exc()
+        finally:
+            ib.disconnect()
+
+    try:
+        asyncio.run(_chain_test())
+    except Exception as e:
+        chain_result['steps'].append(f'asyncio.run ERROR: {e}')
+
+    result['chain_debug'] = chain_result
+
+    # Test the actual fetcher code path (with ThreadPoolExecutor + asyncio.run)
+    from options_ollie.data.ibkr_fetcher import IBKRDataFetcher
+    fetcher = IBKRDataFetcher(host='127.0.0.1', port=4001, client_id=13, timeout=15)
+    try:
+        chain_df = fetcher.get_options_chain('ANZ.AX', min_dte=14, max_dte=90)
+        result['fetcher_rows'] = len(chain_df)
+        result['fetcher_error_detail'] = fetcher.last_error
+        if not chain_df.empty:
+            sample = chain_df.head(2).to_dict('records')
+            result['fetcher_sample'] = sample
+    except Exception as e:
+        result['fetcher_error'] = str(e)
+
+    return jsonify(result)
 
 
 @app.route('/api/scan')
@@ -2584,6 +2799,108 @@ def api_update_holding(symbol):
             break
     save_holdings(holdings)
     return jsonify({'success': True, 'holdings': holdings})
+
+
+@app.route('/api/ibkr-sync-positions')
+def api_ibkr_sync_positions():
+    """
+    Read all stock positions from IBKR and sync to my_holdings.json.
+    Updates avg_cost and shares for existing holdings; adds new ones.
+    Skips option/bond/other non-equity positions.
+    """
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _fetch_positions():
+        async def _async_fetch():
+            from ib_insync import IB
+            ib = IB()
+            try:
+                await ib.connectAsync('127.0.0.1', 4001, clientId=20, readonly=True, timeout=15)
+                await ib.reqPositionsAsync()
+                import asyncio as _aio
+                await _aio.sleep(1)   # let positions arrive
+                positions = ib.positions()
+                result = []
+                for pos in positions:
+                    c = pos.contract
+                    # Only equities (stocks)
+                    if c.secType != 'STK':
+                        continue
+                    qty = float(pos.position)
+                    if qty <= 0:
+                        continue
+                    # avgCost from IBKR is per-share cost basis for equities
+                    avg_cost = float(pos.avgCost) if pos.avgCost else None
+
+                    # Map exchange to symbol format
+                    if c.primaryExchange in ('ASX',) or c.exchange in ('ASX',):
+                        symbol = c.symbol + '.AX'
+                        exchange = 'ASX'
+                    else:
+                        symbol = c.symbol
+                        exchange = c.primaryExchange or c.exchange or 'NASDAQ'
+
+                    result.append({
+                        'symbol': symbol,
+                        'shares': int(qty),
+                        'avg_cost': round(avg_cost, 4) if avg_cost else None,
+                        'exchange': exchange,
+                        'account': pos.account,
+                    })
+                return result, None
+            except Exception as e:
+                import traceback
+                return [], f"{e}\n{traceback.format_exc()}"
+            finally:
+                ib.disconnect()
+
+        return asyncio.run(_async_fetch())
+
+    try:
+        with ThreadPoolExecutor(1) as pool:
+            ibkr_positions, error = pool.submit(_fetch_positions).result(timeout=30)
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+    if error:
+        return jsonify({'error': error})
+
+    if not ibkr_positions:
+        return jsonify({'error': 'No equity positions found in IBKR account'})
+
+    holdings = load_holdings()
+    added, updated = [], []
+
+    for pos in ibkr_positions:
+        sym = pos['symbol']
+        existing = next((h for h in holdings if h['symbol'] == sym), None)
+        if existing:
+            old_cost = existing.get('avg_cost')
+            old_shares = existing.get('shares')
+            existing['shares'] = pos['shares']
+            if pos['avg_cost']:
+                existing['avg_cost'] = pos['avg_cost']
+            if existing['shares'] != old_shares or existing.get('avg_cost') != old_cost:
+                updated.append(sym)
+        else:
+            holdings.append({
+                'symbol': sym,
+                'shares': pos['shares'],
+                'avg_cost': pos['avg_cost'],
+                'exchange': pos['exchange'],
+                'notes': f"Auto-imported from IBKR ({pos['account']})",
+            })
+            added.append(sym)
+
+    save_holdings(holdings)
+    return jsonify({
+        'success': True,
+        'positions_found': len(ibkr_positions),
+        'added': added,
+        'updated': updated,
+        'holdings': holdings,
+    })
 
 
 @app.route('/api/config', methods=['GET'])
@@ -2942,6 +3259,8 @@ def api_log_trade():
             trade = ledger.enter_shares(sym, int(data['shares']), float(data['cost_per_share']), notes)
         elif t == 'protective_put':
             trade = ledger.enter_protective_put(sym, float(data['strike']), data['expiry'], float(data['premium']), contracts, commission, notes, entry_date=entry_date)
+        elif t == 'collar':
+            trade = ledger.enter_collar(sym, float(data['cc_strike']), float(data['put_strike']), data['expiry'], float(data['cc_premium']), float(data['put_cost']), contracts, commission, notes, entry_date=entry_date)
         else:
             return jsonify({'success': False, 'error': f'Unknown type: {t}'})
         return jsonify({'success': True, 'trade_id': trade.id, 'premium_received': round(trade.premium_received, 2)})

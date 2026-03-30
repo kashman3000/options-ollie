@@ -6,8 +6,8 @@ Manages the full wheel cycle: Cash-Secured Put → Assignment → Covered Call �
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
 import pandas as pd
-from ..config import OllieConfig, Position, Portfolio
-from ..data.fetcher import OptionsDataFetcher
+from ..config import OllieConfig, Position, Portfolio, ASX_CONTRACT_MULTIPLIER, US_CONTRACT_MULTIPLIER
+from ..data.fetcher import OptionsDataFetcher, _is_asx
 from ..data.screener import OptionsScreener
 from .oi_analysis import analyze_oi_structure
 from .intelligence import next_best_action
@@ -75,11 +75,12 @@ class WheelManager:
         for sym in symbols_with_shares:
             if sym not in symbols_with_ccs:
                 shares = portfolio.shares_held(sym)
-                if shares >= 100:
+                multiplier = ASX_CONTRACT_MULTIPLIER if _is_asx(sym) else US_CONTRACT_MULTIPLIER
+                if shares >= multiplier:
                     status['ready_for_cc'].append({
                         'symbol': sym,
                         'shares': shares,
-                        'contracts_available': shares // 100
+                        'contracts_available': shares // multiplier
                     })
 
         # Calculate total premium collected from history
@@ -112,7 +113,12 @@ class WheelManager:
         from scipy.stats import norm
 
         symbol = symbol.upper().strip()
-        is_asx = symbol.endswith('.AX')
+        is_asx = _is_asx(symbol)
+
+        # ASX: 1,000 shares per contract; US: 100
+        contract_multiplier = ASX_CONTRACT_MULTIPLIER if is_asx else US_CONTRACT_MULTIPLIER
+        currency = 'AUD' if is_asx else 'USD'
+        currency_symbol = 'A$' if is_asx else '$'
 
         info = self.fetcher.get_stock_info(symbol)
         if not info:
@@ -120,33 +126,33 @@ class WheelManager:
 
         current_price = info['price']
         cost_basis = avg_cost or current_price
-        contracts = shares // 100
+        contracts = shares // contract_multiplier
         position_value = round(current_price * shares, 2)
         total_cost = round(cost_basis * shares, 2)
         unrealized_pnl = round((current_price - cost_basis) * shares, 2)
 
         # ── Fetch options chain (wide DTE range for protection analysis) ──
-        # ASX stocks: skip options — yfinance has no ASX options data
-        chain_df = pd.DataFrame()
+        # ASX: routed to IBKRDataFetcher automatically by OptionsDataFetcher
+        # ASX options have fewer expiries (monthly/quarterly) so use a wider window
+        max_dte = 90 if is_asx else 60
+        chain_df = self.fetcher.get_options_chain(symbol, min_dte=14, max_dte=max_dte)
+
+        # Surface IBKR errors so they show in the UI (not just hidden in stdout)
+        ibkr_error = None
+        if chain_df.empty and is_asx and self.fetcher._ibkr:
+            ibkr_error = self.fetcher._ibkr.last_error
+
+        from ..data.screener import _extract_atm_iv
+        atm_iv = _extract_atm_iv(chain_df, current_price)
+
+        iv_data = self.fetcher.get_iv_rank(symbol, current_iv=atm_iv)
+        iv_rank_pct = iv_data['iv_rank']
+        hv30        = iv_data['hv30']
+        vrop        = iv_data['vrop']
+        current_iv  = iv_data['current_iv']
+
         cc_candidates = pd.DataFrame()
-        iv_rank_pct = 0.0
-        hv30 = 0.0
-        vrop = 0.0
-        current_iv = 0.0
-        if not is_asx:
-            chain_df = self.fetcher.get_options_chain(symbol, min_dte=20, max_dte=60)
-
-            # Extract ATM implied volatility from the live options chain so
-            # get_iv_rank uses real IV (not just HV as proxy).
-            from ..data.screener import _extract_atm_iv
-            atm_iv = _extract_atm_iv(chain_df, current_price)
-
-            iv_data = self.fetcher.get_iv_rank(symbol, current_iv=atm_iv)
-            iv_rank_pct = iv_data['iv_rank']   # already 0-100
-            hv30       = iv_data['hv30']
-            vrop       = iv_data['vrop']
-            current_iv = iv_data['current_iv']
-
+        if not chain_df.empty:
             cc_candidates = self.screener.screen_covered_call_candidates(
                 symbol, shares, avg_cost=cost_basis
             )
@@ -154,8 +160,7 @@ class WheelManager:
         # ── Earnings date fetch (F4 — Earnings Blackout Filter) ──────────────
         earnings_date = None
         earnings_days_away = None
-        if not is_asx:
-            try:
+        try:
                 import yfinance as yf
                 tk = yf.Ticker(symbol)
                 cal = tk.calendar
@@ -182,15 +187,14 @@ class WheelManager:
                     if earnings_days_away < 0:
                         earnings_date = None   # past earnings, clear it
                         earnings_days_away = None
-            except Exception:
-                pass  # Silently skip if earnings data unavailable
+        except Exception:
+            pass  # Silently skip if earnings data unavailable
 
         # ── Ex-dividend date fetch ────────────────────────────────────────────
         exdiv_date = None
         exdiv_days_away = None
         dividend_amount = 0.0
-        if not is_asx:
-            try:
+        try:
                 import datetime as _datetime
                 tk_info = tk.info
                 exdiv_ts = tk_info.get('exDividendDate')
@@ -205,12 +209,15 @@ class WheelManager:
                         exdiv_date = str(exdiv_d)
                     else:
                         exdiv_days_away = None   # already passed
-            except Exception:
-                pass
+        except Exception:
+            pass
 
         recommendation = {
             'symbol': symbol,
             'is_asx': is_asx,
+            'currency': currency,
+            'currency_symbol': currency_symbol,
+            'contract_multiplier': contract_multiplier,
             'current_price': current_price,
             'cost_basis': cost_basis,
             'shares_held': shares,
@@ -239,15 +246,16 @@ class WheelManager:
             'collar_strategies': [],
             'cost_basis_roadmap': {},
             'market_structure': {},
+            'ibkr_error': ibkr_error,
         }
 
         # ── CC recommendation ──────────────────────────────────────────────
-        if is_asx:
-            recommendation['action'] = f"HOLD — Options analysis not available for ASX stocks ({symbol})"
+        if chain_df.empty and is_asx:
+            err_detail = f" Error: {ibkr_error}" if ibkr_error else ""
+            recommendation['action'] = f"HOLD — IBKR chain fetch failed ({symbol})"
             recommendation['reasoning'] = (
-                "yfinance does not provide ASX options chains. "
-                "Position value and downside risk are still tracked below. "
-                "Consider using a local broker platform (e.g. CommSec, SelfWealth) to check options availability."
+                f"No options chain data returned.{err_detail} "
+                "Ensure IB Gateway is running on port 4001 with API access enabled."
             )
         elif not cc_candidates.empty:
             top_3 = cc_candidates.head(3).to_dict('records')
@@ -329,7 +337,7 @@ class WheelManager:
                         mid = float(row.get('lastPrice') or 0)
                     if mid <= 0:
                         continue  # skip if genuinely no price data
-                    total_cost_puts = round(mid * contracts * 100, 2)
+                    total_cost_puts = round(mid * contracts * contract_multiplier, 2)
                     effective_floor = round(float(row['strike']) - mid, 2)
                     floor_vs_basis = round((effective_floor - cost_basis) / cost_basis * 100, 1)
                     # Annualised cost of protection
@@ -383,7 +391,7 @@ class WheelManager:
                     cc_premium = float(cc.get('mid_price') or 0)
                     if cc_premium <= 0:
                         cc_premium = float(cc.get('lastPrice') or 0)
-                    net_credit = round((cc_premium - put_cost) * contracts * 100, 2)
+                    net_credit = round((cc_premium - put_cost) * contracts * contract_multiplier, 2)
                     collar_strategies.append({
                         'cc_strike': cc['strike'],
                         'cc_premium': round(cc_premium, 2),
@@ -450,11 +458,7 @@ class WheelManager:
         # ── Risk notes (enhanced) ──────────────────────────────────────────
         hv = info.get('hv_30', 0)
         one_sigma_move = round(current_price * hv * (30 / 252) ** 0.5, 2)
-        earnings_note = (
-            f"Never sell options through earnings — check next earnings date before placing any trade"
-            if not is_asx else
-            "Check next earnings date before making portfolio decisions."
-        )
+        earnings_note = "Never sell options through earnings — check next earnings date before placing any trade."
         recommendation['risk_notes'] = [
             f"{symbol} 30-day historical vol: {hv*100:.0f}% — "
             f"a typical monthly move is ±${one_sigma_move:.0f} (1 standard deviation)",
@@ -466,11 +470,9 @@ class WheelManager:
         ]
         if current_price < cost_basis:
             recommendation['risk_notes'].insert(0,
-                f"⚠️ {symbol} is ${cost_basis - current_price:.2f} BELOW cost basis. "
-                + ("Selling CCs below basis locks in loss if called away. "
-                   "Consider a collar for protection while waiting for recovery."
-                   if not is_asx else
-                   "Consider averaging down or setting a stop-loss.")
+                f"⚠️ {symbol} is {currency_symbol}{cost_basis - current_price:.2f} BELOW cost basis. "
+                "Selling CCs below basis locks in loss if called away. "
+                "Consider a collar for protection while waiting for recovery."
             )
         elif (current_price - cost_basis) / cost_basis < 0.03:
             recommendation['risk_notes'].insert(0,

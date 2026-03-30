@@ -169,15 +169,38 @@ class PositionMonitor:
                     (snap.current_price - trade.entry_price) * trade.quantity, 2
                 )
         else:
-            # Sold option: profit = premium received - current cost to close
-            cost_to_close = snap.current_option_price * trade.quantity * 100
-            snap.unrealized_pnl = round(trade.premium_received - cost_to_close, 2)
-
-            # % of max profit captured
-            if trade.premium_received > 0:
-                snap.pct_max_profit = round(
-                    snap.unrealized_pnl / trade.premium_received * 100, 1
+            # If option price couldn't be fetched (e.g. stock price lookup also
+            # failed so the chain block was skipped), fall back to time-decay
+            # estimate so we don't show a bogus 100% profit.
+            if snap.current_option_price == 0.0 and trade.entry_price and snap.dte is not None:
+                _entry_dte: Optional[int] = None
+                if trade.entry_date and trade.expiry:
+                    try:
+                        _ed = datetime.strptime(trade.entry_date, '%Y-%m-%d')
+                        _ex = datetime.strptime(trade.expiry, '%Y-%m-%d')
+                        _entry_dte = max((_ex - _ed).days, 1)
+                    except ValueError:
+                        pass
+                snap.current_option_price = self._estimate_current_price(
+                    trade.entry_price, snap.dte, _entry_dte
                 )
+
+            if trade.trade_type == TradeType.PROTECTIVE_PUT:
+                # Long option (bought hedge): P&L = current value - cost paid.
+                # premium_received is stored as a negative number for bought options.
+                current_value = snap.current_option_price * trade.quantity * 100
+                snap.unrealized_pnl = round(current_value + trade.premium_received, 2)
+                # pct_max_profit is not meaningful for a hedge — leave at 0.0
+            else:
+                # Sold option: profit = premium received - current cost to close
+                cost_to_close = snap.current_option_price * trade.quantity * 100
+                snap.unrealized_pnl = round(trade.premium_received - cost_to_close, 2)
+
+                # % of max profit captured — only meaningful when we have a price
+                if trade.premium_received > 0 and snap.current_option_price > 0:
+                    snap.pct_max_profit = round(
+                        snap.unrealized_pnl / trade.premium_received * 100, 1
+                    )
 
         # ── Distance to strike(s) ─────────────────────────────────────────
         if snap.current_price:
@@ -489,6 +512,53 @@ class PositionMonitor:
             snap.advice_actions = actions
             return snap
 
+        # ── For protective puts (bought hedges) ──────────────────────────
+        if trade.trade_type == TradeType.PROTECTIVE_PUT:
+            pnl = snap.unrealized_pnl
+            strike = trade.strike or 0
+            if dte is not None and dte <= 5:
+                level = ADVICE_URGENT
+                headline = f"⚠️ {dte} DTE — Hedge expiring soon"
+                detail = (f"Your ${strike:.0f} protective put expires in {dte} days. "
+                          "If you still want downside protection, roll it out to a later expiry now. "
+                          "Waiting until expiry leaves you unhedged.")
+                actions.append(f"Roll put to next month at same or nearby strike")
+                actions.append("Evaluate whether hedge is still needed given current portfolio risk")
+            elif dte is not None and dte <= 14:
+                level = ADVICE_WATCH
+                headline = f"👁 {dte} DTE — Consider rolling hedge"
+                if pnl > 0:
+                    detail = (f"Your hedge is up ${pnl:.0f} — the stock has moved toward your put. "
+                              f"With {dte} DTE, decide: close and take profit, or roll out to maintain protection.")
+                    actions.append("Close put and take profit if downside risk has passed")
+                    actions.append(f"Roll out to next month to maintain protection")
+                else:
+                    detail = (f"Hedge is at a loss of ${abs(pnl):.0f} with {dte} DTE. "
+                              "If you still want protection, roll out now before time decay accelerates.")
+                    actions.append(f"Roll put to next expiry if downside protection still needed")
+                    actions.append("Let expire worthless if you no longer need the hedge")
+            elif pnl > 0:
+                level = ADVICE_WATCH
+                headline = f"📈 Hedge gaining — up ${pnl:.0f}"
+                detail = (f"Your ${strike:.0f} put has gained ${pnl:.0f} — the stock has likely moved "
+                          "lower. Consider taking partial profits or rolling to lock in gains.")
+                actions.append("Consider closing or rolling up to lock in gains")
+            else:
+                level = ADVICE_HOLD
+                loss = abs(pnl)
+                headline = f"🛡 Hedge in place — cost ${loss:.0f} so far"
+                detail = (f"Your ${strike:.0f} protective put is costing ${loss:.0f} in unrealized loss "
+                          "as the stock holds above your strike. This is the expected behaviour — "
+                          "the hedge is insurance, not a profit centre.")
+                actions.append("Hold — let the hedge do its job")
+                if dte:
+                    actions.append(f"Plan to roll at ~14 DTE if protection still needed")
+            snap.advice_level = level
+            snap.advice_headline = headline
+            snap.advice_detail = detail
+            snap.advice_actions = actions
+            return snap
+
         # ── For options trades ────────────────────────────────────────────
 
         # Rule 1: URGENT — very close to expiry
@@ -606,8 +676,12 @@ class PositionMonitor:
         """
         Aggregate summary of all monitored positions — for dashboard / Telegram.
         """
-        total_premium = sum(s.premium_received for s in snapshots)
-        total_unrealized = sum(s.unrealized_pnl for s in snapshots)
+        # Only include short-premium positions (premium_received > 0) in the
+        # captured-% aggregate.  Long options (protective puts) have negative
+        # premium_received and would skew the summary bar negatively.
+        short_snaps = [s for s in snapshots if s.premium_received > 0]
+        total_premium = sum(s.premium_received for s in short_snaps)
+        total_unrealized = sum(s.unrealized_pnl for s in short_snaps)
         urgents = [s for s in snapshots if s.advice_level == ADVICE_URGENT]
         actions = [s for s in snapshots if s.advice_level == ADVICE_ACTION]
         watches = [s for s in snapshots if s.advice_level == ADVICE_WATCH]

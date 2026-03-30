@@ -19,6 +19,7 @@ class TradeType(str, Enum):
     BEAR_CALL_SPREAD = 'bear_call_spread'
     LONG_SHARES = 'long_shares'          # Share assignment or purchase
     PROTECTIVE_PUT = 'protective_put'    # Bought put hedge on existing shares
+    COLLAR = 'collar'                    # Sell CC + buy protective put simultaneously
 
 
 class TradeStatus(str, Enum):
@@ -255,6 +256,35 @@ class TradeLedger:
             option_side='put',
             premium_received=round(-premium_per_contract * contracts * 100, 2),  # debit
             collateral_required=0.0,
+            commission=commission,
+            notes=notes,
+        )
+        self.trades.append(trade)
+        self.save()
+        return trade
+
+    def enter_collar(self, symbol: str, cc_strike: float, put_strike: float,
+                     expiry: str, cc_premium: float, put_cost: float,
+                     contracts: int = 1, commission: float = 0.0,
+                     notes: str = '', entry_date: str = None) -> Trade:
+        """Record a collar (sell covered call + buy protective put simultaneously).
+
+        Net premium = cc_premium - put_cost.  Positive = net credit; negative = net debit.
+        Stored using short_call_strike (CC leg) and short_put_strike (put floor).
+        """
+        net_premium = cc_premium - put_cost
+        trade = Trade(
+            id=self._gen_id(),
+            symbol=symbol.upper(),
+            trade_type=TradeType.COLLAR,
+            entry_date=entry_date or datetime.now().strftime('%Y-%m-%d'),
+            entry_price=net_premium,
+            quantity=contracts,
+            short_call_strike=cc_strike,
+            short_put_strike=put_strike,
+            expiry=expiry,
+            option_side='',
+            premium_received=round(net_premium * contracts * 100, 2),
             commission=commission,
             notes=notes,
         )

@@ -2,8 +2,14 @@
   {
     "symbol": "RDDT",
     "shares": 200,
-    "avg_cost": null,
+    "avg_cost": 260.0,
     "exchange": "NASDAQ",
     "notes": "Core wheel position"
-  }
-]
+  },
+  {
+    "symbol": "ANZ.AX",
+    "shares": 100,
+    "avg_cost": 20.0,
+    "exchange": "NASDAQ",
+    "notes": ""
+  },

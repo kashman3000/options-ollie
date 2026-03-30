@@ -129,6 +129,43 @@ class TelegramConfig:
         self.chat_id = os.environ.get('OLLIE_TELEGRAM_CHAT_ID', self.chat_id)
         self.enabled = bool(self.bot_token and self.chat_id)
 
+# ─── IBKR Config ─────────────────────────────────────────────────────────────
+
+@dataclass
+class IBKRConfig:
+    """Interactive Brokers connection settings for ASX options data."""
+    host: str = '127.0.0.1'
+    port: int = 4001          # 4001 = live, 4002 = paper
+    client_id: int = 10
+    timeout: int = 10
+    enabled: bool = True      # Set False to disable IBKR routing (ASX options will be unavailable)
+
+    def __post_init__(self):
+        import os
+        port_env = os.environ.get('OLLIE_IBKR_PORT')
+        if port_env:
+            self.port = int(port_env)
+        host_env = os.environ.get('OLLIE_IBKR_HOST')
+        if host_env:
+            self.host = host_env
+
+# ─── ASX-specific constants ───────────────────────────────────────────────────
+
+ASX_CONTRACT_MULTIPLIER = 100     # ASX equity options: 100 shares per contract (same as US)
+ASX_RISK_FREE_RATE = 0.041        # RBA cash rate — update as needed
+US_CONTRACT_MULTIPLIER  = 100     # US options: 100 shares per contract
+US_RISK_FREE_RATE = 0.05          # Fed funds rate approximation
+
+@dataclass
+class ASXRiskProfile(RiskProfile):
+    """
+    ASX-specific risk profile adjustments.
+    ASX options markets are thinner than US — relax liquidity thresholds.
+    """
+    min_open_interest: int = 20     # ASX OI is typically much lower
+    min_volume: int = 5             # ASX daily volume is thinner
+    max_bid_ask_spread_pct: float = 0.10  # Allow wider spreads on ASX
+
 # ─── MenthorQ Config (Future) ────────────────────────────────────────────────
 
 @dataclass
@@ -146,9 +183,11 @@ class MenthorQConfig:
 @dataclass
 class OllieConfig:
     risk: RiskProfile = field(default_factory=RiskProfile)
+    asx_risk: ASXRiskProfile = field(default_factory=ASXRiskProfile)
     portfolio: Portfolio = field(default_factory=Portfolio)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     menthorq: MenthorQConfig = field(default_factory=MenthorQConfig)
+    ibkr: IBKRConfig = field(default_factory=IBKRConfig)
     data_dir: str = 'data'
     portfolio_file: str = 'portfolio.json'
 

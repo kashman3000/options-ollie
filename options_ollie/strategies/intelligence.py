@@ -48,7 +48,9 @@ def next_best_action(rec: Dict, gemini_key: str = None) -> Dict:
     }
     """
     is_asx = rec.get('is_asx', False)
-    if is_asx:
+    # Only fall back to ASX_HOLD if we genuinely have no options data.
+    # If IBKR provided a chain, run the normal scoring engine.
+    if is_asx and not rec.get('top_covered_calls') and not rec.get('protective_strategies'):
         return _asx_result(rec)
 
     signals, score_breakdown = _score_signals(rec)
@@ -491,7 +493,8 @@ def _pick_action_type(scores: Dict, rec: Dict) -> str:
         # Can't sell any option — eliminate CC
         scores['SELL_CC'] = -999
 
-    if rec.get('is_asx', False):
+    # ASX_HOLD only if genuinely no options data (IB Gateway not connected)
+    if rec.get('is_asx', False) and not rec.get('top_covered_calls') and not rec.get('protective_strategies'):
         return 'ASX_HOLD'
 
     # PREPARE_ASSIGNMENT only wins if it was explicitly triggered by wheel cycle signal
@@ -874,32 +877,42 @@ def _asx_result(rec: Dict) -> Dict:
     pnl = rec.get('unrealized_pnl', 0) or 0
     pnl_str = f"{'▲' if pnl >= 0 else '▼'} ${abs(pnl):,.0f}"
 
+    # Surface the actual IBKR error if wheel.py captured one
+    ibkr_error = rec.get('ibkr_error', '')
+    if ibkr_error:
+        reasoning = (
+            f"{sym} is an ASX-listed stock. IBKR chain fetch failed: {ibkr_error}. "
+            f"Ensure IB Gateway is running on port 4001 with API access enabled and try again."
+        )
+    else:
+        reasoning = (
+            f"{sym} is an ASX-listed stock. No options data was returned from IB Gateway. "
+            f"Make sure IB Gateway is running on port 4001 with API access enabled. "
+            f"Once connected, full covered call, protective put, and collar analysis will appear here."
+        )
+
     return {
         'action_type': 'ASX_HOLD',
         'confidence': 70,
-        'headline': f"Hold {sym} — monitor via ASX broker",
+        'headline': f"Hold {sym} — awaiting IBKR options data",
         'icon': '📊',
         'color': 'blue',
         'signals': [
             {'label': 'Exchange', 'value': 'ASX', 'color': 'blue',
-             'tooltip': 'ASX-listed stock. yfinance does not provide ASX options chains.'},
+             'tooltip': 'ASX-listed stock. Options data sourced via IB Gateway.'},
             {'label': 'Unrealized P&L', 'value': pnl_str,
              'color': 'green' if pnl >= 0 else 'red',
              'tooltip': 'Mark-to-market gain/loss vs your cost basis.'},
             {'label': 'Price', 'value': f'${price:.2f}', 'color': 'blue',
              'tooltip': 'Current price from yfinance (15-min delayed for ASX).'},
+            {'label': 'IBKR Status', 'value': 'Error' if ibkr_error else 'No data',
+             'color': 'red' if ibkr_error else 'orange',
+             'tooltip': ibkr_error or 'No options chain returned — check IB Gateway is running'},
         ],
-        'reasoning': (
-            f"{sym} is an ASX-listed stock. Options analysis requires a local broker platform — "
-            f"CommSec Pocket, SelfWealth, or Interactive Brokers (ASX options) all support equity options. "
-            f"Your downside scenarios and position tracking are still shown below so you can "
-            f"evaluate the position risk and size."
-        ),
+        'reasoning': reasoning,
         'education': (
-            "📚 ASX Options: The ASX does have exchange-traded options on major stocks (ANZ, BHP, CBA, etc.), "
-            "but real-time data isn't available through yfinance. "
-            "To run a wheel strategy on ASX stocks, use the ASX options calculator at "
-            "mxoptions.com.au or check option chains directly in your broker platform."
+            "ASX Options via IBKR: Options Ollie connects to IB Gateway to pull live ASX options chains. "
+            "Ensure IB Gateway is open and logged in, then refresh this position."
         ),
         'specific_trade': {},
         'score_breakdown': {},

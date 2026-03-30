@@ -1,6 +1,13 @@
 """
 Options Ollie — Data Fetching Layer
-Abstracts data sources: yfinance now, MenthorQ when available.
+Abstracts data sources: yfinance for US stocks, IBKR for ASX options.
+
+Routing logic:
+  - Symbols ending in .AX  → IBKRDataFetcher (ASX options via IB Gateway)
+  - All other symbols       → yfinance (US stocks, ETFs)
+
+If IB Gateway is not running, ASX options calls return empty DataFrames
+gracefully — the app won't crash, it will just show no options data.
 """
 
 import yfinance as yf
@@ -13,15 +20,42 @@ import warnings
 warnings.filterwarnings('ignore')
 
 
-class OptionsDataFetcher:
-    """Fetches stock and options data. Swap to MenthorQ by subclassing."""
+def _is_asx(symbol: str) -> bool:
+    return symbol.upper().strip().endswith('.AX')
 
-    def __init__(self, source: str = 'yfinance'):
+
+class OptionsDataFetcher:
+    """
+    Fetches stock and options data.
+    Auto-routes .AX symbols to IBKRDataFetcher; everything else uses yfinance.
+    """
+
+    def __init__(self, source: str = 'yfinance',
+                 ibkr_host: str = '127.0.0.1',
+                 ibkr_port: int = 4001,
+                 ibkr_client_id: int = 10):
         self.source = source
         self._cache: Dict[str, any] = {}
+        self._ibkr_host = ibkr_host
+        self._ibkr_port = ibkr_port
+        self._ibkr_client_id = ibkr_client_id
+        self._ibkr: Optional['IBKRDataFetcher'] = None
+
+    def _get_ibkr(self):
+        """Lazily instantiate IBKRDataFetcher on first .AX request."""
+        if self._ibkr is None:
+            from .ibkr_fetcher import IBKRDataFetcher
+            self._ibkr = IBKRDataFetcher(
+                host=self._ibkr_host,
+                port=self._ibkr_port,
+                client_id=self._ibkr_client_id,
+            )
+        return self._ibkr
 
     def get_stock_info(self, symbol: str) -> Dict:
         """Get current price, volume, market cap, IV rank, etc."""
+        if _is_asx(symbol):
+            return self._get_ibkr().get_stock_info(symbol)
         ticker = yf.Ticker(symbol)
         info = ticker.info or {}
         hist = ticker.history(period='1y')
@@ -62,8 +96,11 @@ class OptionsDataFetcher:
     def get_options_chain(self, symbol: str, min_dte: int = 20, max_dte: int = 50) -> pd.DataFrame:
         """
         Get full options chain filtered by DTE range.
+        Routes .AX symbols to IBKR; US symbols use yfinance.
         Returns DataFrame with puts and calls, enriched with Greeks estimates.
         """
+        if _is_asx(symbol):
+            return self._get_ibkr().get_options_chain(symbol, min_dte=min_dte, max_dte=max_dte)
         ticker = yf.Ticker(symbol)
         try:
             expirations = ticker.options
@@ -247,7 +284,13 @@ class OptionsDataFetcher:
 
     def get_earnings_calendar(self, symbols: List[str]) -> Dict[str, Optional[str]]:
         """Check upcoming earnings dates — avoid selling options through earnings."""
+        # Route ASX symbols to the IBKR fetcher's earnings handler
+        asx_syms = [s for s in symbols if _is_asx(s)]
+        us_syms = [s for s in symbols if not _is_asx(s)]
         earnings = {}
+        if asx_syms:
+            earnings.update(self._get_ibkr().get_earnings_calendar(asx_syms))
+        symbols = us_syms
         for sym in symbols:
             try:
                 ticker = yf.Ticker(sym)
@@ -266,6 +309,9 @@ class OptionsDataFetcher:
 
     def get_iv_rank(self, symbol: str, lookback_days: int = 252,
                     current_iv: float = None) -> dict:
+        if _is_asx(symbol):
+            return self._get_ibkr().get_iv_rank(symbol, lookback_days=lookback_days,
+                                                  current_iv=current_iv)
         """
         Calculate IV Rank over a 3-month window and Volatility Risk Premium.
 

@@ -21,6 +21,10 @@ data/trade_ledger.json
 data/portfolio.json
 # latest_scan.json excluded above — but my_holdings.json IS committed (user config)
 
+# Secrets — never commit API keys
+data/config.json
+.env
+
 # Scan output cache
 latest_scan.json
 dashboard.html
