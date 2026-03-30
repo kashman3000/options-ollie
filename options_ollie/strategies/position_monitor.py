@@ -258,12 +258,15 @@ class PositionMonitor:
                 bs_call = self._bs_from_chain(chain.calls, short_call_strike, current_price, dte, True, symbol)
                 if round(bs_put + bs_call, 2) > 0:
                     return round(bs_put + bs_call, 2)
-                # lastPrice fallback
+                # sqrt-of-time before stale lastPrice
+                time_est = self._estimate_current_price(entry_price, dte, entry_dte)
+                if time_est > 0:
+                    return time_est
                 lp = self._chain_last_price(chain.puts, short_put_strike)
                 lc = self._chain_last_price(chain.calls, short_call_strike)
                 if round(lp + lc, 2) > 0:
                     return round(lp + lc, 2)
-                return self._estimate_current_price(entry_price, dte, entry_dte)
+                return 0.0
             else:
                 df = chain.puts if option_type == 'put' else chain.calls
                 target_strike = strike
@@ -274,19 +277,24 @@ class PositionMonitor:
             if mid > 0:
                 return mid
 
-            # 2. Black-Scholes with cross-expiry implied vol — more accurate than
-            #    a stale lastPrice when the stock has moved since the last trade.
+            # 2. Black-Scholes with cross-expiry implied vol.  Returns 0.0 for
+            #    deep OTM options (price < $0.05) so we fall through to step 3.
             bs_price = self._bs_from_chain(df, target_strike, current_price, dte, is_call, symbol)
             if bs_price > 0:
                 return bs_price
 
-            # 3. lastPrice — stale but better than nothing
+            # 3. Sqrt-of-time decay model — self-consistent with entry price and
+            #    DTE, more reliable than a potentially very stale lastPrice.
+            time_est = self._estimate_current_price(entry_price, dte, entry_dte)
+            if time_est > 0:
+                return time_est
+
+            # 4. lastPrice — last resort; can be days stale outside market hours
             last = self._chain_last_price(df, target_strike)
             if last > 0:
                 return last
 
-            # 4. Last resort: sqrt-of-time decay model
-            return self._estimate_current_price(entry_price, dte, entry_dte)
+            return 0.0
 
         except Exception:
             # Fallback: estimate using simple time-decay model
@@ -358,7 +366,11 @@ class PositionMonitor:
                 price = S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
             else:
                 price = K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
-            return round(max(float(price), 0.01), 2)
+            # Do NOT apply a 0.01 floor — if BS gives a near-zero price for a
+            # deep OTM option return 0.0 so the caller falls through to the
+            # sqrt-of-time estimate, which is more meaningful than $0.01.
+            result = round(float(price), 2)
+            return result if result >= 0.05 else 0.0
         except Exception:
             return 0.0
 
