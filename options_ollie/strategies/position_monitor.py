@@ -258,15 +258,12 @@ class PositionMonitor:
                 bs_call = self._bs_from_chain(chain.calls, short_call_strike, current_price, dte, True, symbol)
                 if round(bs_put + bs_call, 2) > 0:
                     return round(bs_put + bs_call, 2)
-                # sqrt-of-time before stale lastPrice
-                time_est = self._estimate_current_price(entry_price, dte, entry_dte)
-                if time_est > 0:
-                    return time_est
+                # lastPrice before sqrt-of-time (reflects actual stock moves)
                 lp = self._chain_last_price(chain.puts, short_put_strike)
                 lc = self._chain_last_price(chain.calls, short_call_strike)
                 if round(lp + lc, 2) > 0:
                     return round(lp + lc, 2)
-                return 0.0
+                return self._estimate_current_price(entry_price, dte, entry_dte)
             else:
                 df = chain.puts if option_type == 'put' else chain.calls
                 target_strike = strike
@@ -283,18 +280,14 @@ class PositionMonitor:
             if bs_price > 0:
                 return bs_price
 
-            # 3. Sqrt-of-time decay model — self-consistent with entry price and
-            #    DTE, more reliable than a potentially very stale lastPrice.
-            time_est = self._estimate_current_price(entry_price, dte, entry_dte)
-            if time_est > 0:
-                return time_est
-
-            # 4. lastPrice — last resort; can be days stale outside market hours
+            # 3. lastPrice — most recent traded price; reflects actual stock
+            #    moves unlike the time-only sqrt model.
             last = self._chain_last_price(df, target_strike)
             if last > 0:
                 return last
 
-            return 0.0
+            # 4. Sqrt-of-time decay model — last resort when no market data at all.
+            return self._estimate_current_price(entry_price, dte, entry_dte)
 
         except Exception:
             # Fallback: estimate using simple time-decay model

@@ -549,7 +549,10 @@ tr:hover td{background:rgba(255,255,255,.02)}
   <div id="tab-positions" class="tab-content">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;flex-wrap:wrap;gap:10px">
       <h2 style="font-size:17px">Open Positions &amp; Advice</h2>
-      <button class="btn btn-success" id="mon-btn" onclick="runMonitor()">▶ Refresh &amp; Get Advice</button>
+      <div style="display:flex;gap:8px">
+        <button class="btn" id="pos-ibkr-sync-btn" style="font-size:12px;padding:6px 14px;background:#1a3a5c;color:#fff;border:none;border-radius:6px;cursor:pointer" onclick="syncFromIBKR()">🔗 Sync from IBKR</button>
+        <button class="btn btn-success" id="mon-btn" onclick="runMonitor()">▶ Refresh &amp; Get Advice</button>
+      </div>
     </div>
     <div id="mon-summary" class="summary-strip hidden"></div>
     <div id="mon-results"><div class="empty"><div class="ico">📊</div><p>Click <strong>Refresh &amp; Get Advice</strong> to check your open positions.</p></div></div>
@@ -1338,8 +1341,9 @@ async function removeHolding(sym){
 }
 
 async function syncFromIBKR(){
-  const btn=document.getElementById('ibkr-sync-btn');
-  btn.disabled=true; btn.textContent='🔄 Syncing…';
+  // Button may be in the Scan tab or the Positions tab — disable whichever is present
+  const btns=[document.getElementById('ibkr-sync-btn'),document.getElementById('pos-ibkr-sync-btn')].filter(Boolean);
+  btns.forEach(b=>{b.disabled=true;b.textContent='🔄 Syncing…'});
   try{
     const r=await fetch('/api/ibkr-sync-positions');
     const data=await r.json();
@@ -1351,7 +1355,7 @@ async function syncFromIBKR(){
     showToast(msg.length ? msg.join(' | ') : 'Holdings synced from IBKR', 'success');
     runScan();
   }catch(e){showToast('IBKR sync error: '+e.message,'error');}
-  finally{btn.disabled=false; btn.textContent='🔗 Sync from IBKR';}
+  finally{btns.forEach(b=>{b.disabled=false;b.textContent='🔗 Sync from IBKR'});}
 }
 
 // ── SETTINGS ─────────────────────────────────────────────────────────────
