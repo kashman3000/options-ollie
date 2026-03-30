@@ -2293,7 +2293,9 @@ async function runMonitor(){
     if(!data.positions||!data.positions.length){
       document.getElementById('mon-results').innerHTML='<div class="empty"><div class="ico">📭</div><p>No open positions yet.<br>Run a scan and click <strong style="color:var(--accent)">Log This Trade</strong> after placing a trade in your broker.</p><button class="btn btn-primary" onclick="showTab(\'scan\')" style="margin-top:14px">📡 Go to Scan</button></div>';return
     }
-    renderMonSummary(data);renderMonPositions(data.positions);showToast('Positions updated','success');
+    renderMonSummary(data);renderMonPositions(data.positions);
+    const src=data.ibkr_live?'🟢 Live from IBKR':'🟡 Estimated (IBKR offline)';
+    showToast('Positions updated — '+src, data.ibkr_live?'success':'info');
   }catch(e){showToast('Error: '+e.message,'error')}
   finally{btn.disabled=false;btn.innerHTML='▶ Refresh &amp; Get Advice'}
 }
@@ -3272,6 +3274,105 @@ def api_log_trade():
         return jsonify({'success': False, 'error': str(e)})
 
 
+def _fetch_ibkr_pnl() -> dict:
+    """
+    Connect to IBKR and return live P&L for every open option position.
+
+    Returns a dict keyed by (symbol, strike, expiry_yyyy-mm-dd, 'call'|'put'):
+        { 'unrealized_pnl': float, 'market_price': float }
+
+    Returns {} silently if IB Gateway is unreachable or returns no data.
+    """
+    import asyncio as _asyncio
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+    from datetime import datetime as _dt2
+
+    def _run():
+        async def _async():
+            from ib_insync import IB
+            ib = IB()
+            try:
+                await ib.connectAsync('127.0.0.1', 4001, clientId=22,
+                                      readonly=True, timeout=10)
+                # Request account updates so portfolio() is populated
+                await ib.reqAccountUpdatesAsync(subscribe=False, acctCode='')
+                import asyncio as _aio2
+                await _aio2.sleep(1.0)
+                items = ib.portfolio()
+                result = {}
+                for item in items:
+                    c = item.contract
+                    if c.secType != 'OPT':
+                        continue
+                    raw = (c.lastTradeDateOrContractMonth or '')[:8]
+                    try:
+                        exp = _dt2.strptime(raw, '%Y%m%d').strftime('%Y-%m-%d')
+                    except Exception:
+                        continue
+                    right = 'call' if c.right.upper().startswith('C') else 'put'
+                    sym = c.symbol.upper()
+                    if getattr(c, 'primaryExchange', '') == 'ASX' or \
+                       getattr(c, 'exchange', '') == 'ASX':
+                        sym += '.AX'
+                    key = (sym, round(float(c.strike), 2), exp, right)
+                    result[key] = {
+                        'unrealized_pnl': round(float(item.unrealizedPNL), 2),
+                        'market_price':   round(abs(float(item.marketPrice)), 4),
+                    }
+                return result
+            except Exception:
+                return {}
+            finally:
+                try:
+                    ib.disconnect()
+                except Exception:
+                    pass
+
+        return _asyncio.run(_async())
+
+    try:
+        with _TPE(1) as pool:
+            return pool.submit(_run).result(timeout=20)
+    except Exception:
+        return {}
+
+
+def _ibkr_keys_for_snap(snap) -> list:
+    """
+    Build the IBKR lookup key(s) for a PositionSnapshot.
+    Single-leg trades return one key; IC/spreads/collars return two.
+    """
+    sym  = snap.symbol.upper()
+    exp  = snap.expiry or ''
+    tt   = snap.trade_type
+
+    if tt in ('covered_call', 'bear_call_spread'):
+        strike = snap.short_call_strike or snap.strike
+        return [(sym, round(float(strike), 2), exp, 'call')] if strike else []
+
+    elif tt in ('csp', 'bull_put_spread', 'protective_put'):
+        strike = snap.short_put_strike or snap.strike
+        return [(sym, round(float(strike), 2), exp, 'put')] if strike else []
+
+    elif tt == 'iron_condor':
+        keys = []
+        if snap.short_put_strike:
+            keys.append((sym, round(float(snap.short_put_strike), 2), exp, 'put'))
+        if snap.short_call_strike:
+            keys.append((sym, round(float(snap.short_call_strike), 2), exp, 'call'))
+        return keys
+
+    elif tt == 'collar':
+        keys = []
+        if snap.short_call_strike:
+            keys.append((sym, round(float(snap.short_call_strike), 2), exp, 'call'))
+        if snap.short_put_strike:
+            keys.append((sym, round(float(snap.short_put_strike), 2), exp, 'put'))
+        return keys
+
+    return []
+
+
 @app.route('/api/monitor')
 def api_monitor():
     try:
@@ -3280,7 +3381,34 @@ def api_monitor():
             return jsonify({'positions': [], 'total_positions': 0})
         monitor = PositionMonitor(ledger)
         snapshots = monitor.monitor_all()
-        return jsonify(_sanitise(monitor.summary_report(snapshots)))
+
+        # ── IBKR P&L override ────────────────────────────────────────────
+        # Try to replace yfinance-estimated P&L with live IBKR numbers.
+        # Silently skipped when IB Gateway isn't running.
+        ibkr_live = False
+        try:
+            ibkr_data = _fetch_ibkr_pnl()
+            if ibkr_data:
+                matched_count = 0
+                for snap in snapshots:
+                    keys    = _ibkr_keys_for_snap(snap)
+                    matched = [ibkr_data[k] for k in keys if k in ibkr_data]
+                    if not matched:
+                        continue
+                    snap.unrealized_pnl      = round(sum(m['unrealized_pnl'] for m in matched), 2)
+                    snap.current_option_price = matched[0]['market_price']
+                    if snap.premium_received != 0:
+                        snap.pct_max_profit = round(
+                            snap.unrealized_pnl / abs(snap.premium_received) * 100, 1
+                        )
+                    matched_count += 1
+                ibkr_live = matched_count > 0
+        except Exception:
+            pass  # IBKR unavailable — yfinance estimates remain
+
+        result = _sanitise(monitor.summary_report(snapshots))
+        result['ibkr_live'] = ibkr_live
+        return jsonify(result)
     except Exception as e:
         return jsonify({'error': str(e)})
 
